@@ -18,17 +18,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "dispatch_utils.h"
-#include "hip_compat.h"
+#include "aiter_dispatch.h"
+#include "aiter_hip_common.h"
 #include "hip_reduce.h"
-#include "py_itfs_common.h"
-#include "vec_convert.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/all.h>
+#include "aiter_opus_plus.h"
+#include "aiter_stream.h"
+#include "moe_op.h"
 
-#include <hipcub/hipcub.hpp>
-#include <hipcub/util_type.hpp>
+#include <algorithm>
+#include <cfloat>
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -60,17 +58,21 @@ class alignas(Alignment) AlignedArray
 // in the softmax kernel when we extend this module to support expert-choice routing.
 template <typename DTYPE, int TPB>
 __launch_bounds__(TPB) __global__
-    void moeSoftmax(const DTYPE* input, const bool* finished, float* output, const int num_cols)
+    void moeSoftmax(const DTYPE* input,
+                    const bool* finished,
+                    float* output,
+                    const int num_cols,
+                    const int input_row_stride)
 {
-    using BlockReduce = hipcub::BlockReduce<float, TPB>;
-    __shared__ typename BlockReduce::TempStorage tmpStorage;
-
     __shared__ float normalizing_factor;
     __shared__ float float_max;
 
-    const int thread_row_offset = blockIdx.x * num_cols;
+    // `input` is the caller's gating tensor, whose rows may be strided; `output` is the
+    // compact fp32 workspace, so the two need separate row offsets.
+    const int thread_row_offset = blockIdx.x * input_row_stride;
+    const int output_row_offset = blockIdx.x * num_cols;
 
-    hipcub::Sum sum;
+    aiter::Sum sum;
     float threadData(-FLT_MAX);
 
     // Don't touch finished rows.
@@ -85,7 +87,7 @@ __launch_bounds__(TPB) __global__
         threadData    = max(static_cast<float>(input[idx]), threadData);
     }
 
-    const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, hipcub::Max());
+    const float maxElem = block_reduce<float, aiter::Max, TPB, true>(threadData, aiter::Max());
     if(threadIdx.x == 0)
     {
         float_max = maxElem;
@@ -100,7 +102,7 @@ __launch_bounds__(TPB) __global__
         threadData += exp((static_cast<float>(input[idx]) - float_max));
     }
 
-    const auto Z = BlockReduce(tmpStorage).Reduce(threadData, sum);
+    const auto Z = block_reduce<float, aiter::Sum, TPB, true>(threadData, sum);
 
     if(threadIdx.x == 0)
     {
@@ -110,9 +112,10 @@ __launch_bounds__(TPB) __global__
 
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
-        const int idx   = thread_row_offset + ii;
-        const float val = exp((static_cast<float>(input[idx]) - float_max)) * normalizing_factor;
-        output[idx]     = val;
+        const float val =
+            exp((static_cast<float>(input[thread_row_offset + ii]) - float_max)) *
+            normalizing_factor;
+        output[output_row_offset + ii] = val;
     }
 }
 
@@ -126,15 +129,15 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
                                                const int k,
                                                const int start_expert,
                                                const int end_expert,
+                                               const int output_row_stride,
+                                               const int index_row_stride,
                                                const bool need_renorm)
 {
 
-    using cub_kvp     = hipcub::KeyValuePair<int, float>;
-    using BlockReduce = hipcub::BlockReduce<cub_kvp, TPB>;
-    __shared__ typename BlockReduce::TempStorage tmpStorage;
+    using cub_kvp = aiter::KeyValuePair<int, float>;
 
     cub_kvp thread_kvp;
-    hipcub::ArgMax arg_max;
+    aiter::ArgMax arg_max;
 
     const int num_rows  = gridDim.x;
     const int block_row = blockIdx.x;
@@ -156,7 +159,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
 
             for(int prior_k = 0; prior_k < k_idx; ++prior_k)
             {
-                const int prior_winning_expert = indices[k * block_row + prior_k];
+                const int prior_winning_expert = indices[index_row_stride * block_row + prior_k];
 
                 if(prior_winning_expert == expert)
                 {
@@ -167,7 +170,9 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
             thread_kvp = arg_max(inp_kvp, thread_kvp);
         }
 
-        const cub_kvp result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
+        // The __syncthreads() at the end of this loop body also separates
+        // consecutive block_reduce rounds, which share one smem staging buffer.
+        const cub_kvp result_kvp = block_reduce<cub_kvp, aiter::ArgMax, TPB, true>(thread_kvp, arg_max);
         if(threadIdx.x == 0)
         {
             // Ignore experts the node isn't responsible for with expert parallelism
@@ -175,11 +180,13 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
             const bool node_uses_expert   = expert >= start_expert && expert < end_expert;
             const bool should_process_row = row_is_active && node_uses_expert;
 
-            const int idx = k * block_row + k_idx;
-            output[idx]   = result_kvp.value;
-            indices[idx]  = should_process_row ? (expert - start_expert) : num_experts;
-            assert(indices[idx] >= 0);
-            source_rows[idx] = k_idx * num_rows + block_row;
+            // source_rows stays compactly packed, matching the fast path.
+            const int output_idx  = output_row_stride * block_row + k_idx;
+            const int indices_idx = index_row_stride * block_row + k_idx;
+            output[output_idx]    = result_kvp.value;
+            indices[indices_idx]  = should_process_row ? (expert - start_expert) : num_experts;
+            assert(indices[indices_idx] >= 0);
+            source_rows[k * block_row + k_idx] = k_idx * num_rows + block_row;
 
             if(need_renorm)
             {
@@ -194,7 +201,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
         renorm_value = 1 / renorm_value;
         for(int k_idx = 0; k_idx < k; k_idx++)
         {
-            int64_t const idx = k * block_row + k_idx;
+            int64_t const idx = output_row_stride * block_row + k_idx;
             output[idx] *= renorm_value;
         }
     }
@@ -222,7 +229,7 @@ template <typename DTYPE,
           bool need_renorm,
           int NUM_SHARED_EXPERTS = 0,
           SharedExpertScoringFunc SCORING_FUNC = SharedExpertScoringFunc::NONE>
-__launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
+__launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     void topkGatingSoftmax(const DTYPE* input,
                            const bool* finished,
                            float* output,
@@ -241,7 +248,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     static_assert(NUM_EXPERTS == (NUM_EXPERTS & -NUM_EXPERTS), "NUM_EXPERTS must be power of 2");
     static_assert(BYTES_PER_LDG == (BYTES_PER_LDG & -BYTES_PER_LDG),
                   "BYTES_PER_LDG must be power of 2");
-    static_assert(BYTES_PER_LDG <= 32, "BYTES_PER_LDG must be leq 32");
+    // static_assert(BYTES_PER_LDG <= 32, "BYTES_PER_LDG must be leq 32");
 
     // Number of bytes each thread pulls in per load
     static constexpr int ELTS_PER_LDG    = BYTES_PER_LDG / sizeof(DTYPE);
@@ -304,11 +311,9 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     // param. In theory, this can support all powers of 2 up to 16. NOTE(woosuk): The original
     // implementation uses CUTLASS aligned array here. We defined our own aligned array and use it
     // here to avoid the dependency on CUTLASS.
-    using AccessType = ck_tile::vec_t<DTYPE, ELTS_PER_LDG>;
-    using ChunkType  = ck_tile::vec_t<float, ELTS_PER_LDG>;
-    using kvp        = hipcub::KeyValuePair<int, float>;
-    // hipcub::ArgMax arg_max;
-    // hipcub::ArgMin arg_min;
+    using AccessType = opus::vector_t<DTYPE, ELTS_PER_LDG>;
+    using ChunkType  = opus::vector_t<float, ELTS_PER_LDG>;
+    using kvp        = aiter::KeyValuePair<int, float>;
 
     // Finally, we pull in the data from global mem
     float row_chunk[VPT];
@@ -317,8 +322,11 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
 #pragma unroll
     for(int ii = 0; ii < LDG_PER_THREAD; ++ii)
     {
-        row_chunk_vec_ptr[ii] = ck_tile::vec_convert<float, DTYPE, ELTS_PER_LDG>(
-            vec_thread_read_ptr[ii * THREADS_PER_ROW]);
+        AccessType vec = vec_thread_read_ptr[ii * THREADS_PER_ROW];
+        for(int jj = 0; jj < ELTS_PER_LDG; ++jj)
+        {
+            row_chunk_vec_ptr[ii][jj] = static_cast<float>(vec[jj]);
+        }
     }
 
     // Process shared experts: use the thread subgroup working on this row
@@ -497,7 +505,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     }
 }
 
-namespace detail {
+namespace topk_detail {
 // Constructs some constants needed to partition the work across threads at compile time.
 template <typename DTYPE, int EXPERTS, int BYTES_PER_LDG>
 struct TopkConstants
@@ -506,12 +514,12 @@ struct TopkConstants
     static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 ||
                       EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0,
                   "");
-    static constexpr int VECs_PER_THREAD = MAX(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE));
+    // AITER_CHECK(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) > 1, "not supported");
+    static constexpr int VECs_PER_THREAD = 1;
     static constexpr int VPT             = VECs_PER_THREAD * ELTS_PER_LDG;
     static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
-    static constexpr int ROWS_PER_WARP   = WARP_SIZE / THREADS_PER_ROW;
 };
-} // namespace detail
+} // namespace topk_detail
 
 template <typename DTYPE,
           int EXPERTS,
@@ -533,14 +541,15 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                      const bool need_renorm,
                                      hipStream_t stream)
 {
-    static constexpr std::size_t MAX_BYTES_PER_LDG = 32;
+    static constexpr std::size_t MAX_BYTES_PER_LDG = EXPERTS < 512 ? 32 : 64;
 
     static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(DTYPE) * EXPERTS);
-    using Constants                    = detail::TopkConstants<DTYPE, EXPERTS, BYTES_PER_LDG>;
+    using Constants                    = topk_detail::TopkConstants<DTYPE, EXPERTS, BYTES_PER_LDG>;
+    AITER_CHECK(EXPERTS / (Constants::ELTS_PER_LDG * WARP_SIZE) <= 1, "EXPERTS:", EXPERTS, " not supported");
     static constexpr int VPT           = Constants::VPT;
-    static constexpr int ROWS_PER_WARP = Constants::ROWS_PER_WARP;
-    const int num_warps                = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
-    const int num_blocks               = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
+    int ROWS_PER_WARP   = get_warp_size_func() / Constants::THREADS_PER_ROW;
+    int num_warps                = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
+    int num_blocks               = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
 
     dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
     if(need_renorm)
@@ -611,12 +620,12 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
             case 8: LAUNCH_SOFTMAX_WITH_SHARED(NUM_EXPERTS, WARPS_PER_TB, 8,               \
                                               SharedExpertScoringFunc::SIGMOID); break;     \
             default:                                                                        \
-                TORCH_CHECK(false, "Unsupported num_shared_experts: " +                    \
+                AITER_CHECK(false, "Unsupported num_shared_experts: " +                    \
                             std::to_string(num_shared_experts) +                            \
                             ". Supported values: 1, 2, 4, 8");                              \
             }                                                                               \
         } else {                                                                            \
-            TORCH_CHECK(false, "Unsupported scoring function");                             \
+            AITER_CHECK(false, "Unsupported scoring function");                             \
         }                                                                                   \
     } while(0)
 
@@ -674,7 +683,7 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
         }
         else
         {
-            TORCH_CHECK(false, "Unsupported shared expert scoring function: " + shared_experts_scoring_func);
+            AITER_CHECK(false, "Unsupported shared expert scoring function: " + shared_experts_scoring_func);
         }
     }
 
@@ -694,12 +703,12 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
     case 256: LAUNCH_SOFTMAX(256, WARPS_PER_TB); break;
     case 512: LAUNCH_SOFTMAX(512, 2); break;
     default: {
-        TORCH_CHECK(
+        AITER_CHECK(
             softmax_workspace != nullptr,
             "softmax_workspace must be provided for num_experts that are not a power of 2.");
         static constexpr int TPB = 256;
         moeSoftmax<DTYPE, TPB><<<num_tokens, TPB, 0, stream>>>(
-            gating_output, nullptr, softmax_workspace, num_experts);
+            gating_output, nullptr, softmax_workspace, num_experts, gating_token_stride);
         moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(softmax_workspace,
                                                      nullptr,
                                                      topk_weights,
@@ -709,6 +718,8 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
                                                      topk,
                                                      0,
                                                      num_experts,
+                                                     topk_weights_stride,
+                                                     topk_id_stride,
                                                      need_renorm);
 
         // Handle shared experts for non-power-of-2 case
@@ -738,13 +749,15 @@ __global__ void moe_sum_kernel(scalar_t* __restrict__ out,         // [..., d]
     const int64_t token_idx = blockIdx.x;
     for(int64_t idx = threadIdx.x; idx < d; idx += blockDim.x)
     {
-        scalar_t x = 0.0;
+        // Accumulate in fp32 (matches torch.sum accumulation dtype) so the native
+        // HIP scalar types (__half / hip_bfloat16) sum correctly.
+        float x = 0.0f;
 #pragma unroll
         for(int k = 0; k < TOPK; ++k)
         {
-            x += VLLM_LDG(&input[token_idx * TOPK * d + k * d + idx]);
+            x += static_cast<float>(input[token_idx * TOPK * d + k * d + idx]);
         }
-        out[token_idx * d + idx] = x;
+        out[token_idx * d + idx] = static_cast<scalar_t>(x);
     }
 }
 
@@ -753,10 +766,11 @@ __global__ void moe_sum_kernel(scalar_t* __restrict__ out,         // [..., d]
 
 namespace aiter {
 
-void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk + num_shared_experts]
-                  torch::Tensor& topk_indices,         // [num_tokens, topk]
-                  torch::Tensor& token_expert_indices, // [num_tokens, topk]
-                  torch::Tensor& gating_output,        // [num_tokens, num_experts + num_shared_experts]
+void topk_softmax(const aiter_tensor_t& topk_weights,         // [num_tokens, topk + num_shared_experts]
+                  const aiter_tensor_t& topk_indices,         // [num_tokens, topk]
+                  const aiter_tensor_t& token_expert_indices, // [num_tokens, topk]
+                  const aiter_tensor_t& gating_output,        // [num_tokens, num_experts + num_shared_experts]
+                  const aiter_tensor_t& softmax_workspace,    // [num_tokens * num_routing_experts] fp32, python-allocated
                   bool need_renorm,
                   int num_shared_experts,
                   const std::string& shared_expert_scoring_func)
@@ -774,29 +788,25 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk + nu
     // Validate shared expert scoring function
     if(num_shared_experts > 0 && !shared_expert_scoring_func.empty())
     {
-        TORCH_CHECK(shared_expert_scoring_func == "sigmoid",
+        AITER_CHECK(shared_expert_scoring_func == "sigmoid",
                    "Only 'sigmoid' scoring function is supported for shared experts, got: " +
                    shared_expert_scoring_func);
     }
 
-    const bool is_pow_2          = (num_routing_experts != 0) && ((num_routing_experts & (num_routing_experts - 1)) == 0);
-    const bool needs_workspace   = !is_pow_2 || num_routing_experts > 256;
-    const int64_t workspace_size = needs_workspace ? num_tokens * num_routing_experts : 0;
-
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    torch::Tensor softmax_workspace =
-        torch::empty({workspace_size}, gating_output.options().dtype(torch::kFloat32));
+    // Workspace (softmax_workspace) is sized/allocated on the Python side; only the
+    // non-power-of-2 / >256-expert path actually reads it.
+    HipDeviceGuard device_guard(gating_output.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     // Process routing experts with softmax + topk, and shared experts with sigmoid in one kernel
-    VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "topk_softmax", [&] {
-        using input_dtype = typename t2ck<scalar_t>::type;
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(gating_output.dtype(), "topk_softmax", [&] {
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;
         vllm::moe::topkGatingSoftmaxKernelLauncher(
             reinterpret_cast<input_dtype*>(gating_output.data_ptr()),
-            topk_weights.data_ptr<float>(),
-            topk_indices.data_ptr<int>(),
-            token_expert_indices.data_ptr<int>(),
-            softmax_workspace.data_ptr<float>(),
+            reinterpret_cast<float*>(topk_weights.data_ptr()),
+            reinterpret_cast<int*>(topk_indices.data_ptr()),
+            reinterpret_cast<int*>(token_expert_indices.data_ptr()),
+            reinterpret_cast<float*>(softmax_workspace.data_ptr()),
             num_tokens,
             num_routing_experts,  // Only routing experts for softmax
             num_shared_experts,   // Number of shared experts to process with sigmoid
@@ -810,8 +820,11 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk + nu
     });
 }
 
-void moe_sum(torch::Tensor& input,  // [num_tokens, topk, hidden_size]
-             torch::Tensor& output) // [num_tokens, hidden_size]
+// Only topk in {2, 4, 5} is handled here. Other topk values are summed on the
+// Python side via torch.sum (see aiter/ops/moe_op.py::moe_sum), so the C side
+// stays torch-free.
+void moe_sum(const aiter_tensor_t& input,  // [num_tokens, topk, hidden_size]
+             const aiter_tensor_t& output) // [num_tokens, hidden_size]
 {
     const int hidden_size = input.size(-1);
     const int num_tokens  = output.numel() / hidden_size;
@@ -820,32 +833,43 @@ void moe_sum(torch::Tensor& input,  // [num_tokens, topk, hidden_size]
     dim3 grid(num_tokens);
     dim3 block(std::min(hidden_size, 1024));
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(output));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(output.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     switch(topk)
     {
     case 2:
-        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
+        VLLM_DISPATCH_FLOATING_TYPES_rmTorch(input.dtype(), "moe_sum_kernel", [&] {
             vllm::moe::moe_sum_kernel<scalar_t, 2><<<grid, block, 0, stream>>>(
-                output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
+                reinterpret_cast<scalar_t*>(output.data_ptr()),
+                reinterpret_cast<scalar_t*>(input.data_ptr()),
+                hidden_size);
         });
         break;
 
     case 4:
-        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
+        VLLM_DISPATCH_FLOATING_TYPES_rmTorch(input.dtype(), "moe_sum_kernel", [&] {
             vllm::moe::moe_sum_kernel<scalar_t, 4><<<grid, block, 0, stream>>>(
-                output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
+                reinterpret_cast<scalar_t*>(output.data_ptr()),
+                reinterpret_cast<scalar_t*>(input.data_ptr()),
+                hidden_size);
         });
         break;
 
     case 5:
-        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
+        VLLM_DISPATCH_FLOATING_TYPES_rmTorch(input.dtype(), "moe_sum_kernel", [&] {
             vllm::moe::moe_sum_kernel<scalar_t, 5><<<grid, block, 0, stream>>>(
-                output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
+                reinterpret_cast<scalar_t*>(output.data_ptr()),
+                reinterpret_cast<scalar_t*>(input.data_ptr()),
+                hidden_size);
         });
         break;
-    default: at::sum_out(output, input, 1); break;
+    default:
+        AITER_CHECK(false,
+                    "moe_sum: topk=",
+                    topk,
+                    " must be handled on the Python side (torch.sum fallback).");
+        break;
     }
 }
 

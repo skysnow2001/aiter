@@ -2,13 +2,22 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
-import sys
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
-import torch
 
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = (
+    os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
+    else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
+)
+sys.path.insert(0, AITER_CORE_DIR)
+from chip_info import build_tune_dict, write_lookup_header
 from gemm_a8w8_bpreshuffle_common import (
     default_kernels_dict,
     kernelInstance,
@@ -42,7 +51,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    int KBatch = 1
     )
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
@@ -50,7 +60,7 @@ torch::Tensor
     // Check if this input needs to be padded.
     int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
     int N = WQ.size(0);
-    int K = WQ.size(1);
+    int K = XQ.size(1);
     bool pad = (M % {k.MPerBLOCK} != 0) || (N % {k.NPerBLOCK} != 0) || (K % ({k.KPerBLOCK}) != 0);
     if (pad)
     {{{{
@@ -75,17 +85,17 @@ torch::Tensor
             {k.AK1}, {k.BK1},
             {k.MPerXDL}, {k.NPerXDL},
             {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
+            S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
             {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
             {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_SPV)}>,
             ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
             ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
         // Run kernel instance.
-        return gemm_a8w8_bpreshuffle_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
+        return gemm_a8w8_bpreshuffle_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, KBatch);
 """
         if self.istune:
             INSTANCE_IMPL_str = INSTANCE_IMPL.format(
@@ -121,7 +131,8 @@ template torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    int KBatch
     );
 
 """
@@ -160,24 +171,14 @@ template torch::Tensor
 
 #endif // USE_ROCM
 """
-        with open(
-            os.path.join(self.working_path, "gemm_a8w8_bpreshuffle_lookup.h"), "w"
-        ) as f:
-            f.write(LOOKUP_head)
-            for mnk, k in kernels_dict.items():
-                # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
-                if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(
-                        LOOKUP_template.format(
-                            MNK="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
-                            kernel_name=k.name,
-                        )
-                    )
-                elif self.istune and isinstance(mnk, int):
-                    f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
-            f.write(LOOKUP_end)
+        write_lookup_header(
+            os.path.join(self.working_path, "gemm_a8w8_bpreshuffle_lookup.h"),
+            kernels_dict,
+            LOOKUP_head,
+            LOOKUP_template,
+            LOOKUP_end,
+            self.istune,
+        )
 
     def gen_manifest_head(self, kernels_dict):
         MAINFEST_head = """#pragma once
@@ -198,7 +199,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y);
+    torch::Tensor &Y,
+    int KBatch);
 """
         MAINFEST_end = """
 
@@ -209,8 +211,10 @@ torch::Tensor
             os.path.join(self.working_path, "gemm_a8w8_bpreshuffle_manifest.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for mnk, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_instances(self, kernels_dict):
@@ -221,7 +225,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)
@@ -229,25 +233,11 @@ torch::Tensor
 
 
 def get_tune_dict(tune_dict_csv):
-    tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
-        tune_df = pd.read_csv(tune_dict_csv)
-        if torch.cuda.is_available():
-            gpu = torch.cuda.current_device()
-            device_properties = torch.cuda.get_device_properties(gpu)
-            cu_num = device_properties.multi_processor_count
-            tune_df = tune_df[(tune_df["cu_num"] == cu_num)].reset_index()
-        tune_df = tune_df[tune_df["libtype"] == "ck"].reset_index()
-        for i in range(len(tune_df)):
-            M = tune_df.loc[i, "M"]
-            N = tune_df.loc[i, "N"]
-            K = tune_df.loc[i, "K"]
-            kid = tune_df.loc[i, "kernelId"]
-            if kid < 0 or kid >= len(kernels_list):
-                print(f"[Warning]: kernelId {kid} is out of range, skip it")
-                continue
-            tune_dict[(M, N, K)] = kernels_list[kid]
-    return tune_dict
+        return build_tune_dict(
+            pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list, libtype="ck"
+        )
+    return default_kernels_dict
 
 
 if __name__ == "__main__":

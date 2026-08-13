@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-from aiter.test_common import checkAllclose, perftest
-from aiter import dtypes
-from aiter.fused_moe import torch_moe, fused_topk
-from aiter.fused_moe_bf16_asm import asm_moe
-from aiter.ops.shuffle import shuffle_weight
-from aiter import pertoken_quant
-from aiter.int4_utils import *
-from aiter import ActivationType
 import argparse
+
+import torch
+
+from aiter import ActivationType, dtypes, get_gfx, pertoken_quant
+from aiter.fused_moe import fused_topk, torch_moe
+from aiter.fused_moe_bf16_asm import asm_moe
+from aiter.int4_utils import *
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import checkAllclose, perftest
 
 BLOCK_SIZE_M = 32
 
@@ -167,9 +167,6 @@ def test_fmoe(
     # ref implement
     # w1a = permute_weight_a(w1)
     # w2a = permute_weight_a(w2)
-    w1a = w1
-    w2a = w2
-    avg_a = 1
     # ref1, avg_a = vllm_moe(input,
     #                        w1a,
     #                        w2a,
@@ -189,6 +186,10 @@ def test_fmoe(
             out_b = ref2
             avg_b = 9999
             print("asm g1u1 only support quant/smoothquant Now")
+        elif get_gfx() != "gfx942":
+            out_b = ref2
+            avg_b = 9999
+            print(f"skip asm g1u0 no-quant on {get_gfx()}: only runs on gfx942")
         else:
             out_b, avg_b = asm_moe_test(
                 input, w1b, w2b, topk_weights, topk_ids, activation=activation
@@ -278,36 +279,39 @@ def test_fmoe(
             f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:>8.2f}TB/s"
         )
 
-        if use_smooth and (
-            (
-                (inter_dim % 512 == 0 or inter_dim % 320 == 0)
-                and (w1b.dtype == dtypes.fp8 and inter_dim * 2 == w1b.shape[1])
-            )
-            or (
-                (inter_dim % 320 == 0 or inter_dim % 256 == 0)
-                and (w1b.dtype == dtypes.i8 and inter_dim * 2 == w1b.shape[1])
-            )
-            or (
-                (inter_dim % 512 == 0)
-                and (w1b.dtype == dtypes.i8 and inter_dim == w1b.shape[1])
-            )
-        ):
-            if input.dtype == dtypes.bf16:
-                out_b2, avg_b2 = asm_moe_test(
-                    input,
-                    w1b,
-                    w2b,
-                    topk_weights,
-                    topk_ids,
-                    fc1_scale,
-                    fc2_scale,
-                    fc1_smooth_scale,
-                    fc2_smooth_scale,
-                    a16=True,
-                    activation=activation,
+        if (
+            use_smooth
+            and (
+                (
+                    (inter_dim % 512 == 0 or inter_dim % 320 == 0)
+                    and (w1b.dtype == dtypes.fp8 and inter_dim * 2 == w1b.shape[1])
                 )
-                msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
-                checkAllclose(ref2, out_b2, atol=100, msg=msg)
+                or (
+                    (inter_dim % 320 == 0 or inter_dim % 256 == 0)
+                    and (w1b.dtype == dtypes.i8 and inter_dim * 2 == w1b.shape[1])
+                )
+                or (
+                    (inter_dim % 512 == 0)
+                    and (w1b.dtype == dtypes.i8 and inter_dim == w1b.shape[1])
+                )
+            )
+            and input.dtype == dtypes.bf16
+        ):
+            out_b2, avg_b2 = asm_moe_test(
+                input,
+                w1b,
+                w2b,
+                topk_weights,
+                topk_ids,
+                fc1_scale,
+                fc2_scale,
+                fc1_smooth_scale,
+                fc2_smooth_scale,
+                a16=True,
+                activation=activation,
+            )
+            msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
+            checkAllclose(ref2, out_b2, atol=100, msg=msg)
 
         msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
@@ -410,7 +414,7 @@ parser.add_argument(
 parser.add_argument(
     "-a",
     "--activation",
-    type=dtypes.str2ActivationType,
+    type=str,
     choices=[
         "silu",
         "gelu",
@@ -423,6 +427,7 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+args.activation = dtypes.str2ActivationType(args.activation)
 
 
 for test in args.test:
@@ -506,6 +511,9 @@ for test in args.test:
                         #   quant='fp8quant', use_g1u1=True)
 
     elif test == "g1u0_int8smoothquant":
+        if get_gfx() != "gfx942":
+            print(f"skip {test} on {get_gfx()}: only runs on gfx942")
+            continue
         for dtype in args.dtype:
             for m in args.token:
                 for hdim in args.hidden_dim:
@@ -562,6 +570,9 @@ for test in args.test:
                             activation=args.activation,
                         )
     elif test == "g1u1_int4":
+        if get_gfx() != "gfx942":
+            print(f"skip {test} on {get_gfx()}: only runs on gfx942")
+            continue
         for dtype in args.dtype:
             for m in args.token:
                 for hdim in args.hidden_dim:

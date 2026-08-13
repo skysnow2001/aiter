@@ -3,16 +3,30 @@
 import argparse
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
-import torch
 
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = (
+    os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
+    else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
+)
+sys.path.insert(0, AITER_CORE_DIR)
+from chip_info import (
+    build_tune_dict,
+    write_lookup_header,
+    write_name_keyed_lookup_header,
+)
 from gemm_a8w8_blockscale_cktile_instance import (
-    default_kernels_cktile_dict,
     TileKernelInstance,
-    candidate_kernels_cktile_dict,
     candidate_kernels_by_name,
+    candidate_kernels_cktile_dict,
+    default_kernels_cktile_dict,
 )
 
 """
@@ -35,51 +49,15 @@ class gemm_a8w8_blockscale_codegen:
         """
         Get tune dict from csv file
         """
-
-        tune_dict = default_kernels_cktile_dict
-
         if os.path.exists(tune_dict_csv):
-            tune_df = pd.read_csv(tune_dict_csv)
-            if torch.cuda.is_available():
-                gpu = torch.cuda.current_device()
-                device_properties = torch.cuda.get_device_properties(gpu)
-                cu_num = device_properties.multi_processor_count
-                tune_df = tune_df[
-                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "cktile")
-                ].reset_index()
-            # NOTE: Matching by kernelName (not kernelId). The kernelId column in tuned
-            # CSVs is kept but it is NOT used for kernel selection anymore.
-            # This allows instance lists to be reordered or expanded (e.g. changing
-            # BLOCK_PER_CU_MAX) without invalidating existing tuned CSVs.
-            use_name = "kernelName" in tune_df.columns
-            if not use_name:
-                print(
-                    "[Warning]: tuned CSV has no kernelName column, falling back to kernelId. "
-                    "Re-run tuner to generate a CSV with kernelName for robust matching."
-                )
-            for i in range(len(tune_df)):
-                M = int(tune_df.loc[i, "M"])
-                N = int(tune_df.loc[i, "N"])
-                K = int(tune_df.loc[i, "K"])
-
-                if use_name:
-                    kname = str(tune_df.loc[i, "kernelName"])
-                    if kname in candidate_kernels_by_name:
-                        tune_dict[(M, N, K)] = candidate_kernels_by_name[kname]
-                    else:
-                        print(
-                            f"Warning: kernelName '{kname}' not found for shape ({M}, {N}, {K})"
-                        )
-                else:
-                    kid = int(tune_df.loc[i, "kernelId"])
-                    if kid in candidate_kernels_cktile_dict:
-                        tune_dict[(M, N, K)] = candidate_kernels_cktile_dict[kid]
-                    else:
-                        print(
-                            f"Warning: kernelId {kid} not found for shape ({M}, {N}, {K})"
-                        )
-
-        return tune_dict
+            return build_tune_dict(
+                pd.read_csv(tune_dict_csv),
+                default_kernels_cktile_dict,
+                candidate_kernels_cktile_dict,
+                libtype="cktile",
+                kernels_by_name=candidate_kernels_by_name,
+            )
+        return default_kernels_cktile_dict
 
     def gen_cktile_instance(self, k: TileKernelInstance):
         """
@@ -99,7 +77,8 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    bool preshuffleB
+    bool preshuffleB,
+    int k_batch
     )
 {{
     // Get M, N, K from input tensors.
@@ -121,10 +100,11 @@ torch::Tensor
             {str(k.TransposeC).lower()},
             {str(k.UsePersistentKernel).lower()},
             ck_tile::GemmPipelineScheduler::{k.Scheduler},
-            {k.BlockPerCu}>;
+            {k.BlockPerCu},
+            {str(k.AQRowMajor).lower()}>;
 
         // Run kernel instance.
-        return gemm_a8w8_blockscale_cktile_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+        return gemm_a8w8_blockscale_cktile_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, preshuffleB, k_batch);
 """
 
         TILE_INSTANCE_IMPL_str = TILE_INSTANCE_IMPL.replace(
@@ -147,7 +127,8 @@ template torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    bool preshuffleB
+    bool preshuffleB,
+    int k_batch
     );
 
 """
@@ -168,10 +149,19 @@ template torch::Tensor
 
     def gen_lookup_dict(self, kernels_dict: dict):
         """
-        Generate lookup dictionary for kernel instances
+        Generate lookup dictionary for kernel instances.
+
+        - Tune mode (istune=True): emits a kernelId-keyed table for *_tune.cu.
+        - Non-tune mode (istune=False): emits a name-keyed registry consumed
+          by gemm_a8w8_blockscale_cktile.cu's Python-driven dispatch.
         """
 
-        LOOKUP_head = """#pragma once
+        output_path = os.path.join(
+            self.working_path, "gemm_a8w8_blockscale_cktile_lookup.h"
+        )
+
+        if self.istune:
+            LOOKUP_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -180,33 +170,49 @@ template torch::Tensor
 #define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
    {                                                                                                                             \\"""
 
-        LOOKUP_template = """
+            LOOKUP_template = """
        {{{MNK},                                                                                                       \\
         {kernel_name}<DTYPE, ETYPE>}},                       \\"""
 
-        LOOKUP_end = """
+            LOOKUP_end = """
    }
 
 #endif // USE_ROCM
 """
-        with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_lookup.h"), "w"
-        ) as f:
-            f.write(LOOKUP_head)
-            for mnk, k in kernels_dict.items():
-                # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
-                if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(
-                        LOOKUP_template.format(
-                            MNK="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
-                            kernel_name=k.name,
-                        )
-                    )
-                elif self.istune and isinstance(mnk, int):
-                    f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
-            f.write(LOOKUP_end)
+            write_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+                self.istune,
+            )
+        else:
+            LOOKUP_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
+   {                                                                                                                             \\"""
+
+            LOOKUP_template = """
+       {{"{kernel_name}",                                                                                                       \\
+        {kernel_name}<DTYPE, ETYPE>}},                       \\"""
+
+            LOOKUP_end = """
+   }
+
+#endif // USE_ROCM
+"""
+            write_name_keyed_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+            )
 
     def gen_manifest_head(self, kernels_dict):
         """
@@ -232,7 +238,8 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    bool preshuffleB);
+    bool preshuffleB,
+    int k_batch);
 """
         MAINFEST_end = """
 
@@ -244,8 +251,10 @@ torch::Tensor
             "w",
         ) as f:
             f.write(MAINFEST_head)
-            for _, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for _, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_code(self, kernels_dict: dict):
@@ -254,7 +263,7 @@ torch::Tensor
         """
 
         # generate instances code
-        for _, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_cktile_instance(k)
 
         # generate lookup dict for kernel instances
@@ -281,8 +290,12 @@ torch::Tensor
             # generate code for default kernels
             self.gen_code(candidate_kernels_cktile_dict)
         else:
-            # generate code for tuned kernels from tune_file
-            self.gen_code(self.get_tune_dict(self.tune_file))
+            # Runtime dispatch is keyed by kernelName from Python-selected tuned
+            # rows. Build the full CKTile candidate registry so a newly tuned CSV
+            # cannot reference a valid candidate that is absent from the .so.
+            runtime_kernels = self.get_tune_dict(self.tune_file)
+            runtime_kernels.update(candidate_kernels_cktile_dict)
+            self.gen_code(runtime_kernels)
 
 
 if __name__ == "__main__":

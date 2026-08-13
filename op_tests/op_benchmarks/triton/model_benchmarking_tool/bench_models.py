@@ -1,38 +1,48 @@
-from abc import ABC, abstractmethod
-from contextlib import redirect_stdout, redirect_stderr
-from typing import Callable, TypeAlias, Optional
-import io
-import logging
-import shlex
-import os
-import pandas as pd
-import json
-import re
-import matplotlib.pyplot as plt
 import argparse
-from triton.runtime.errors import OutOfResources
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+import io
+import json
+import logging
+import os
+import re
+import shlex
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
+from typing import TypeAlias
 
-from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import (
-    main as bench_gemm_a16w16_main,
-)
-from op_tests.op_benchmarks.triton.bench_gemm_a8w8_per_token_scale import (
-    main as bench_gemm_a8w8_per_token_scale_main,
-)
-from op_tests.op_benchmarks.triton.bench_gemm_a8w8_blockscale import (
-    main as bench_gemm_a8w8_blockscale_main,
-)
-from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import (
-    main as bench_gemm_afp4wfp4_main,
-)
+import matplotlib.pyplot as plt
+import pandas as pd
+from triton.runtime.errors import OutOfResources
+
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.bench_batched_gemm_a8w8 import (
     main as bench_batched_gemm_a8w8_main,
+)
+from op_tests.op_benchmarks.triton.bench_batched_gemm_a16wfp4 import (
+    main as bench_batched_gemm_a16wfp4_main,
 )
 from op_tests.op_benchmarks.triton.bench_batched_gemm_afp4wfp4 import (
     main as bench_batched_gemm_afp4wfp4_main,
 )
-from op_tests.op_benchmarks.triton.bench_batched_gemm_a16wfp4 import (
-    main as bench_batched_gemm_a16wfp4_main,
+from op_tests.op_benchmarks.triton.bench_gemm_a8w8_blockscale import (
+    main as bench_gemm_a8w8_blockscale_main,
+)
+from op_tests.op_benchmarks.triton.bench_gemm_a8w8_per_token_scale import (
+    main as bench_gemm_a8w8_per_token_scale_main,
+)
+from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import (
+    main as bench_gemm_a16w16_main,
+)
+from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import (
+    main as bench_gemm_afp4wfp4_main,
+)
+from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
+from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
+    main as bench_moe_gemm_a4w4_main,
+)
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4 import (
+    main as bench_moe_gemm_a8w4_main,
 )
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
     main as bench_moe_gemm_a8w8_main,
@@ -40,16 +50,11 @@ from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8_blockscale import (
     main as bench_moe_gemm_a8w8_blockscale_main,
 )
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4 import (
-    main as bench_moe_gemm_a8w4_main,
-)
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
-    main as bench_moe_gemm_a4w4_main,
-)
 from op_tests.op_benchmarks.triton.bench_rmsnorm import main as bench_rmsnorm_main
 from op_tests.op_benchmarks.triton.bench_rope import main as bench_rope_main
-from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
-from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
+from op_tests.op_benchmarks.triton.bench_unified_attention import (
+    main as bench_unified_attention_main,
+)
 
 
 def disable_aiter_logs() -> None:
@@ -71,9 +76,13 @@ KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "moe_op_gemm_a8w4": bench_moe_gemm_a8w4_main,
     "moe_op_gemm_a4w4": bench_moe_gemm_a4w4_main,
     "rmsnorm": bench_rmsnorm_main,
+    # Fused RMSNorm + residual add + MXFP4 quant. Reuses bench_rmsnorm.py
+    # (via its --quant mxfp4 mode), so there is no separate bench script.
+    "fused_rms_mxfp4_quant": bench_rmsnorm_main,
     "rope": bench_rope_main,
     "mha": bench_mha_main,
     "mla": bench_mla_main,
+    "unified_attention": bench_unified_attention_main,
 }
 
 # Shape dicts from model_shapes.json (int, str values)
@@ -213,7 +222,7 @@ class GemmKernelHandler(KernelHandler):
             "Kernel": self._kernel,
             "batch_size": None,
             "seq_len": None,
-            "B": shape["B"] if "B" in shape else None,
+            "B": shape.get("B", None),
             "M": self._M,
             "N": shape["N"],
             "K": shape["K"],
@@ -304,6 +313,17 @@ class RmsnormKernelHandler(KernelHandler):
         }
 
 
+class FusedRmsMxfp4QuantKernelHandler(RmsnormKernelHandler):
+    """Handler for fused RMSNorm + residual add + MXFP4 quant.
+
+    Identical shape handling to RMSNorm (reads N from model_shapes.json); only
+    the bench args differ, flipping bench_rmsnorm.py into its fused-quant mode.
+    """
+
+    def build_args(self) -> str:
+        return super().build_args() + " --quant mxfp4 --add-residual"
+
+
 class RopeKernelHandler(KernelHandler):
     """Handler for RoPE benchmarks."""
 
@@ -374,24 +394,39 @@ class MhaKernelHandler(KernelHandler):
 
     def build_args(self) -> str:
         shape = self._shape
-        return (
-            f"-mode fwd -causal true --layout {self._mha_layout} --dtype bf16 -b {self._batch_size} "
+        # bshd (batch-seq-head-dim) - fwd
+        # thd (token-head-dim) - fwd_varlen with equal seq lens
+        fn = "fwd_varlen" if self._mha_layout == "thd" else "fwd"
+        sliding_window_left = shape.get("sliding_window_left", -1)
+        sink = shape.get("sink", None)
+        args = (
+            f"-fn {fn} -causal true --dtype bf16 -b {self._batch_size} "
             f"-hq {shape['hq']} -hk {shape['hkv']} -sq {self._seq_len} -sk {self._seq_len} "
-            f"-d {shape['dqk']} -dv {shape['dv']} -metric {self._metric}"
+            f"-d {shape['dqk']} -dv {shape['dv']} --window-size-left {sliding_window_left} -metric {self._metric}"
         )
+        if fn == "fwd_varlen":
+            args += " -equal_seqlens"
+        if sink:
+            args += " -sink"
+        return args
 
     def parse_stdout(self, stdout: str) -> float:
+        # Expected output (4 lines):
+        #   [0] "[1/1] <model> B=... HQ=... ..."   (progress)
+        #   [1] "bench_mha:"
+        #   [2] "model  BATCH  HQ  HK  N_CTX_Q  N_CTX_K  D_HEAD  D_HEAD_V  ..."   (header)
+        #   [3] "0  <model>  <b>  <hq>  <hk>  <sq>  <sk>  ...  <value>"   (data)
         lines = [line.split() for line in stdout.strip().splitlines() if line.strip()]
-        if len(lines) < 3:
+        if len(lines) < 4:
             raise ValueError(
-                f"Unexpected MHA bench output: expected at least 3 lines, got {len(lines)}"
+                f"Unexpected MHA bench output: expected at least 4 lines, got {len(lines)}"
             )
-        if lines[0] != ["bench_mha:"]:
-            raise ValueError(f"Unexpected MHA bench output: first line {lines[0]!r}")
-        data = lines[2]
-        if len(data) < 7:
+        if lines[1] != ["bench_mha:"]:
+            raise ValueError(f"Unexpected MHA bench output: second line {lines[1]!r}")
+        data = lines[3]
+        if len(data) < 15:
             raise ValueError(f"Unexpected MHA bench data line: {data!r}")
-        return float(data[6])
+        return float(data[-1])
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
         shape = self._shape
@@ -405,6 +440,8 @@ class MhaKernelHandler(KernelHandler):
             "dqk": shape["dqk"],
             "dv": shape["dv"],
             "mha_layout": self._mha_layout,
+            "sink": shape.get("sink", "false"),
+            "sliding_window": shape.get("sliding_window_left", None),
             self._metric: bench_result,
         }
 
@@ -454,13 +491,66 @@ class MlaKernelHandler(KernelHandler):
         }
 
 
+class UnifiedAttnKernelHandler(KernelHandler):
+    """Handler for unified attention benchmarks (bench_unified_attention.py)."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
+        result = []
+        for shape in shapes:
+            s = shape.copy()
+            self._shard_keys(s, ["hq", "hkv"])
+            result.append(s)
+        return result
+
+    def build_args(self) -> str:
+        shape = self._shape
+        block_size = int(shape.get("block_size", 0))
+        sliding_window = shape.get("sliding_window", None)
+        args = (
+            f"-b {self._batch_size} -hq {shape['hq']} -hk {shape['hkv']} "
+            f"-d {shape['dqk']} -dv {shape['dv']} -sq {self._seq_len} -sk {self._seq_len} "
+            f"-block_size {block_size} --metric {self._metric}"
+        )
+        if sliding_window is not None:
+            args += f" -sliding_window {sliding_window}"
+        return args
+
+    def parse_stdout(self, stdout: str) -> float:
+        lines = [line.split() for line in stdout.strip().splitlines() if line.strip()]
+        if len(lines) < 3:
+            raise ValueError(
+                f"Unexpected unified_attention bench output: expected at least 3 lines, got {len(lines)}"
+            )
+        data = lines[2]
+        if len(data) < 10:
+            raise ValueError(f"Unexpected unified_attention bench data line: {data!r}")
+        return float(data[9])
+
+    def build_result_row(self, bench_result: float | str) -> ResultRow:
+        shape = self._shape
+        return {
+            "Model": self._model,
+            "Kernel": self._kernel,
+            "batch_size": self._batch_size,
+            "seq_len": self._seq_len,
+            "hq": shape["hq"],
+            "hkv": shape["hkv"],
+            "dqk": shape["dqk"],
+            "dv": shape["dv"],
+            "sliding_window": shape.get("sliding_window", None),
+            self._metric: bench_result,
+        }
+
+
 _HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
     (lambda k: "moe" in k, MoeKernelHandler),
     (lambda k: "gemm" in k and "moe" not in k, GemmKernelHandler),
     (lambda k: k == "rmsnorm", RmsnormKernelHandler),
+    (lambda k: k == "fused_rms_mxfp4_quant", FusedRmsMxfp4QuantKernelHandler),
     (lambda k: k == "rope", RopeKernelHandler),
     (lambda k: k == "mha", MhaKernelHandler),
     (lambda k: k == "mla", MlaKernelHandler),
+    (lambda k: k == "unified_attention", UnifiedAttnKernelHandler),
 ]
 
 
@@ -487,10 +577,10 @@ def read_json(json_path: str) -> ModelShapesData:
 
 def call_function(
     bench_fn: Callable[[list[str]], None], handler: KernelHandler
-) -> Optional[str]:
+) -> str | None:
     stdout = io.StringIO()
     stderr = io.StringIO()
-    raw_result: Optional[str] = None
+    raw_result: str | None = None
 
     try:
         with redirect_stdout(stdout), redirect_stderr(stderr):
@@ -508,25 +598,15 @@ def call_function(
             hw_limit = int(match.group(2))
             ratio: float = required / hw_limit
             print(
-                "Out of LDS on %s: %d / %d (%.1fx)"
-                % (
-                    handler.to_str(),
-                    required,
-                    hw_limit,
-                    ratio,
-                )
+                f"Out of LDS on {handler.to_str()}: {required} / {hw_limit} "
+                f"({ratio:.1f}x)"
             )
         else:
-            print("Out of resources while benchmarking %s. %s" % (handler.to_str(), e))
+            print(f"Out of resources while benchmarking {handler.to_str()}. {e}")
 
-    except Exception as e:
+    except (Exception, SystemExit) as e:  # noqa: BLE001
         print(
-            "Unexpected error while benchmarking %s. %s: %s"
-            % (
-                handler.to_str(),
-                type(e).__name__,
-                e,
-            )
+            f"Unexpected error while benchmarking {handler.to_str()}. {type(e).__name__}: {e}"
         )
 
     # Close matplotlib figures to silence errors and avoid memory leaks.
@@ -605,10 +685,12 @@ def run_benchmarks(
                 )
                 continue
 
+            # MLA only reports time (ms)
+            run_metric = "time" if kernel == "mla" else metric
+
             bench_fn = KERNEL_DICT[kernel]
             handler = _get_handler(kernel)
-            # MLA only reports time (ms); use "time" metric for it
-            run_metric = "time" if kernel == "mla" else metric
+
             handler.set_run(model, kernel, run_metric, gemm_layout, mha_layout, TP)
             tp_shapes = handler.get_tp_shapes(shapes)
             for shape in tp_shapes:
@@ -662,7 +744,9 @@ def parse_arg_list(
     return sorted(set(result))  # Remove duplicates and sort
 
 
-def parse_args(available_models: list[str]) -> argparse.Namespace:
+def parse_args(
+    available_models: list[str], available_kernels: list[str]
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Model benchmarking tool",
         allow_abbrev=False,
@@ -719,11 +803,23 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
         "--model",
         default=None,
         help=(
-            "model name filter: case-insensitive regex matched against model name (default: all models). "
+            "Model name filter: case-insensitive regex matched against model names "
+            "(default: all models). "
             "e.g. 'llama3' to include only Llama3 family, "
             "'llama|qwen' to include both Llama and Qwen families, "
             "'^(?!.*deepseek)' to exclude DeepSeek family."
             f"\nAvailable models: {', '.join(available_models)}."
+        ),
+    )
+    parser.add_argument(
+        "--kernel",
+        default=None,
+        help=(
+            "Kernel name filter: case-insensitive regex matched against kernel names "
+            "(default: all kernels). "
+            "e.g. 'gemm' to include any kernel name containing gemm, "
+            "'moe|rmsnorm' for MoE and RMSNorm."
+            f"\nAvailable kernels: {', '.join(available_kernels)}."
         ),
     )
     parser.add_argument(
@@ -754,12 +850,57 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
     return args
 
 
+def filter_models_and_kernels(
+    data: ModelShapesData,
+    available_models: list[str],
+    model_pattern: str | None,
+    kernel_pattern: str | None,
+) -> ModelShapesData | None:
+
+    def _filter_by_regex(
+        pattern: str, pattern_name: str, candidates: list[str]
+    ) -> list[str]:
+        try:
+            pat = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            print(
+                f"Invalid {pattern_name} regex: {pattern!r} - running all {pattern_name}s."
+            )
+            return candidates
+        return [n for n in candidates if pat.search(n) is not None]
+
+    if model_pattern is not None:
+        matched_models = _filter_by_regex(model_pattern, "model", available_models)
+        data = {m: data[m] for m in matched_models}
+        if not data:
+            print("There are no models after filtering by model name.")
+            return None
+
+    if kernel_pattern is not None:
+        filtered: ModelShapesData = {}
+        for m, kernels in data.items():
+            matched_kernels = _filter_by_regex(
+                kernel_pattern, "kernel", sorted(kernels.keys())
+            )
+            kept = {k: kernels[k] for k in matched_kernels}
+            if kept:
+                filtered[m] = kept
+        data = filtered
+        if not data:
+            print("There are no models/kernels after filtering by kernel name.")
+            return None
+
+    return data
+
+
 def main() -> None:
     data = read_json("model_shapes.json")
-    available_models = list(data.keys())
-    args = parse_args(available_models)
+    available_models = sorted(data.keys())
+    available_kernels = sorted(KERNEL_DICT.keys())
+    args = parse_args(available_models, available_kernels)
 
     models = args.model
+    kernels = args.kernel
     batch_sizes = args.batch_size
     seq_lens = args.seq_len
     TP = args.TP
@@ -768,15 +909,10 @@ def main() -> None:
     mha_layout = args.mha_layout
     output_file = args.output_file
 
-    if models is not None:
-        try:
-            pattern: re.Pattern[str] = re.compile(models, re.IGNORECASE)
-            data = {m: data[m] for m in available_models if pattern.search(m)}
-            if not data:
-                print("There are no models after filtering by model name.")
-                return
-        except re.error:
-            print(f"Invalid model filter regex: {models!r} - running all models.")
+    filtered_data = filter_models_and_kernels(data, available_models, models, kernels)
+    if filtered_data is None:
+        return
+    data = filtered_data
 
     results = run_benchmarks(
         data, batch_sizes, seq_lens, TP, gemm_layout, mha_layout, metric

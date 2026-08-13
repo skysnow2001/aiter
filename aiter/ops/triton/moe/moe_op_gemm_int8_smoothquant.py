@@ -2,14 +2,21 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
 import itertools
+
 import torch
 import triton
-from aiter.ops.triton.moe.moe_routing.routing import RoutingData
-from aiter.ops.triton.utils.device_info import get_num_sms
+
+from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_int8_smoothquant import (
+    _gluon_moe_gemm_int8_smoothquant,
+)
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_int8_smoothquant import (
     _moe_gemm_int8_smoothquant,
-    _reduce_grouped,
 )
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
+from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.shuffle import shuffle_weight
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -30,46 +37,27 @@ def should_upcast_indices(*args):
 
 def preshuffle_weights(w: torch.Tensor) -> torch.Tensor:
     """
-    Preshuffle int8 weight from (E, K, N) to MFMA-friendly layout (E, N//16, K*16).
+    Preshuffle int8 weight from (E, K, N) to the MFMA-friendly tile layout
+    (E, K*16, N//16).
 
-    Matches the shuffle_weight pattern from aiter.ops.shuffle for INT8:
-      layout=(16, 16), BK=32, K_lane=16, BN=16
-
-    The transformation:
-      1. Transpose to (E, N, K)
-      2. View as (E, N//16, 16, K//32, 2, 16) - decompose into MFMA tile blocks
-      3. Permute to (E, N//16, K//32, 2, 16, 16) - reorder for register layout
-      4. View as (E, N//16, K*16) - flatten K dimension
+    This is the same transpose-first per-expert (16, 16) tiling that
+    ``aiter.ops.triton.utils.shuffle.shuffle_weight`` produces on its gfx1250
+    path, so the host-side shuffle stays single-sourced in
+    ``aiter.ops.triton.utils.shuffle``. The matching in-kernel inverse is
+    ``unshuffle_weights`` in the int8 smoothquant kernel.
 
     Args:
-        w: int8 weight tensor of shape (E, K, N) where
-           - E = number of experts
-           - K = input dimension (must be divisible by 32)
-           - N = output dimension (must be divisible by 16)
+        w: int8 weight tensor of shape (E, K, N) where K % 32 == 0 and N % 16 == 0.
 
     Returns:
-        Preshuffled weight tensor of shape (E, K * 16, N // 16)
+        Preshuffled weight tensor of shape (E, K * 16, N // 16).
     """
     assert w.dtype == torch.int8, f"Expected int8 weights, got {w.dtype}"
     assert w.ndim == 3, f"Expected 3D weight tensor (E, K, N), got {w.ndim}D"
     E, K, N = w.shape
-    assert K % 32 == 0, f"K ({K}) must be divisible by 32 for MFMA preshuffling"
-    assert N % 16 == 0, f"N ({N}) must be divisible by 16 for MFMA preshuffling"
-
-    # Transpose to (E, N, K)
-    w = w.transpose(1, 2)
-
-    # Preshuffle
-    w = w.view(E, N // 16, 16, K // 32, 2, 16)
-    w = w.permute(0, 1, 3, 4, 2, 5).contiguous()
-
-    # Reshape to (E, N // 16, K * 16)
-    w = w.view(E, N // 16, K * 16)
-
-    # Transpose back to (E, K, N)
-    w = w.transpose(1, 2)
-
-    return w
+    # shuffle_weight returns the (E, K, N) shuffled weight; reshape to the
+    # (E, K*16, N//16) TDM layout the int8 smoothquant kernel consumes.
+    return shuffle_weight(w, arch="gfx1250").view(E, N // 16, K * 16).transpose(-1, -2)
 
 
 def allocate_output(
@@ -114,7 +102,7 @@ def get_kernel_config(m, n, k, routing_data):
         block_k = 256
         num_warps = 4
         num_stages = 2
-        kpack = 2
+        kpack = 2 if arch_info.get_arch() == "gfx942" else 1
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
@@ -147,83 +135,6 @@ def get_kernel_config(m, n, k, routing_data):
     return ret
 
 
-def reduce_grouped(
-    x: torch.Tensor,
-    indx: torch.Tensor,
-    out: torch.Tensor,
-    alpha=1.0,
-    limit=1.0,
-    reduction_n=1,
-    apply_activation: bool = False,
-    out_dtype: torch.dtype = None,
-    add_residual: bool = False,
-):
-    """
-    In-place grouped row reduction.
-
-    Arguments
-    - x: Tensor[AnyFloat] of shape [(num_groups * K), N]
-    - indx: Tensor[Int] of shape [num_groups, K]
-
-    Description
-    For each group g in [0, num_groups), this routine sums the K rows of `x`
-    specified by `indx[g, :]` and overwrites the row corresponding to the first
-    valid (non-negative) index with the per-group sum. Accumulation is performed
-    in float32 for numerical stability, and the result is written back in the
-    dtype of `x`.
-
-    Behavior and edge cases
-    - Invalid (-1) entries are skipped during accumulation and do not generate
-      memory traffic. If a group has no valid entries, nothing is written for
-      that group.
-    - Reduction is performed tile-by-tile along the N dimension within a single
-      kernel launch (persistent along N) to minimize launch overhead.
-
-    Performance notes
-    - Memory traffic per group is approximately (valid_rows_read + 1) * N * sizeof(x),
-      plus index reads. With no invalid entries, this becomes (K + 1) reads/writes
-      of length N per group.
-
-    Returns
-    - The input tensor `x` (modified in place).
-    """
-    if indx is None and x.shape[0] == 1:
-        return x.squeeze(0)
-
-    if indx is not None:
-        num_groups = indx.shape[0]
-    else:
-        num_groups = x.shape[-2]
-    K = 1 if indx is None else indx.shape[1]
-    out_dtype = x.dtype if out_dtype is None else out_dtype
-    assert x.shape[-1] % reduction_n == 0
-    BLOCK_N = 512
-    num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
-
-    _reduce_grouped[(num_blocks, num_groups)](
-        x,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        out,
-        out.stride(0),
-        out.stride(1),
-        indx,
-        x.shape[0],
-        x.shape[-1],
-        alpha,
-        limit,
-        reduction_n,
-        BLOCK_N=BLOCK_N,
-        EVEN_N=(x.shape[-1] % BLOCK_N == 0),
-        K=K,
-        num_warps=2,
-        ADD_RESIDUAL=add_residual,
-        APPLY_ACTIVATION=apply_activation,
-    )
-    return out
-
-
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
@@ -242,7 +153,7 @@ def moe_gemm_int8_smoothquant(
     preshuffled: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
     apply_activation: bool = False,
-    add_residual: bool = False,
+    swiglu_add_residual: bool = False,
     alpha: float = 1.0,
     limit: float = 1.0,
 ):
@@ -310,58 +221,138 @@ def moe_gemm_int8_smoothquant(
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
-    # launch kernel
-    _moe_gemm_int8_smoothquant[(grid,)](
-        y,
-        y.stride(0),
-        y.stride(1),
-        y.stride(2),
-        x,
-        x.stride(0),
-        x.stride(1),
-        x_scale,
-        x_scale.stride(0) if x_scale.ndim > 0 else 0,
-        w,
-        w.stride(0),
-        w.stride(1),
-        w.stride(2),
-        w_scale,
-        w_scale.stride(0),
-        w_scale.stride(1) if w_scale.ndim > 1 else 0,
-        bias,
-        stride_bias,
-        gammas,
-        N,
-        K,
-        gather_indx,
-        expt_hist,
-        expt_token_offs_raw,
-        expt_hist_sum,
-        expt_block_pid_map,
-        grid_m,
-        grid_n,
-        alpha,
-        limit,
-        reduction_n_matmul,
-        (alpha != 0) and (config["split_k"] == 1),  # APPLY_ACTIVATION
-        add_residual,
-        routing_data.n_expts_act,
-        config["block_m"],
-        config["block_n"],
-        config["block_k"],
-        config["group_m"],
-        PRESHUFFLED=preshuffled,
-        EVEN_K=K % config["block_k"] == 0,
-        MASK_K_LIMIT=K % config["block_k"],
-        SPLIT_K=config["split_k"],
-        W_CACHE_MODIFIER=config["w_cache_modifier"],
-        num_warps=config["num_warps"],
-        num_stages=config["num_stages"],
-        UPCAST_INDICES=should_upcast_indices(x, w, y),
-        waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        kpack=config["kpack"],
-    )
+
+    # Determine whether to use the Gluon-optimized kernel for small K
+    # Conditions: CDNA3 arch, K <= 192, N >= 1024, no preshuffling,
+    #             no activation (handled separately), no split_k,
+    #             all tensors within 2GB buffer limit
+    use_gluon = False
+
+    def _is_within_2gb(arg):
+        MAX_INT_32 = 2**31 - 1
+        if isinstance(arg, torch.Tensor) and hasattr(arg, "untyped_storage"):
+            return arg.untyped_storage().size() <= MAX_INT_32
+        return False
+
+    arch = arch_info.get_arch()
+    if (
+        arch == "gfx942"
+        and K <= 192
+        and N >= 1024
+        and M >= 4096
+        and not preshuffled
+        and gather_indx is None
+        and config["split_k"] == 1
+        and not apply_activation
+        and _is_within_2gb(x)
+        and _is_within_2gb(w)
+        and _is_within_2gb(y)
+    ):
+        use_gluon = True
+        gluon_block_k = 64
+        gluon_block_n = 1024 if N % 1024 == 0 else 512
+        gluon_num_warps = 4
+        grid_n = triton.cdiv(N, gluon_block_n)
+        grid = grid_m * grid_n
+
+    if use_gluon:
+        # launch Gluon-optimized kernel
+        _gluon_moe_gemm_int8_smoothquant[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scale,
+            x_scale.stride(0) if x_scale.ndim > 0 else 0,
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scale,
+            w_scale.stride(0),
+            w_scale.stride(1) if w_scale.ndim > 1 else 0,
+            bias,
+            stride_bias,
+            gammas,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            (alpha != 0) and (config["split_k"] == 1),  # APPLY_ACTIVATION
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            gluon_block_n,
+            gluon_block_k,
+            config["group_m"],
+            EVEN_K=K % gluon_block_k == 0,
+            MASK_K_LIMIT=K % gluon_block_k,
+            num_warps=gluon_num_warps,
+        )
+    else:
+        # launch standard kernel
+        _moe_gemm_int8_smoothquant[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scale,
+            x_scale.stride(0) if x_scale.ndim > 0 else 0,
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scale,
+            w_scale.stride(0),
+            w_scale.stride(1) if w_scale.ndim > 1 else 0,
+            bias,
+            stride_bias,
+            gammas,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            (alpha != 0) and (config["split_k"] == 1),  # APPLY_ACTIVATION
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            PRESHUFFLED=preshuffled,
+            EVEN_K=K % config["block_k"] == 0,
+            MASK_K_LIMIT=K % config["block_k"],
+            SPLIT_K=config["split_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+            kpack=config["kpack"],
+        )
     # Build grouped reduction inputs in a uniform way
     group_indx = (
         None
@@ -372,13 +363,12 @@ def moe_gemm_int8_smoothquant(
         y,
         group_indx,
         y_final,
+        apply_activation and (config["split_k"] > 1),  # apply activation if split_k > 1
         alpha,
         limit,
         reduction_n_reduction,
-        apply_activation=(alpha != 0)
-        and (config["split_k"] > 1),  # apply activation if split_k > 1
         out_dtype=out_dtype,
-        add_residual=add_residual,
+        swiglu_add_residual=swiglu_add_residual,
     )
 
     return y_final
@@ -442,6 +432,7 @@ def moe_gemm_smoothquant_torch(
         if gather_indx is None:
             idx = torch.arange(lo, hi, device=x.device)
         else:
+            gather_indx = gather_indx.to(torch.int32)
             idx = gather_indx[lo:hi] // n_expts_act
         out = (
             torch.matmul(x[idx, :].float(), w[i].float())
@@ -458,10 +449,83 @@ def moe_gemm_smoothquant_torch(
     if scatter_indx is None:
         return y
     # accumulate output from all experts
+    scatter_indx = scatter_indx.to(torch.int32)
     n_rows_out = y.shape[0] // n_expts_act
     out = torch.zeros((n_rows_out, y.shape[-1]), dtype=torch.float32, device=x.device)
     src_idx = scatter_indx.view(-1, n_expts_act)
     for i in range(n_rows_out):
         out[i, :] = y[src_idx[i], :].sum(0)
 
+    return out
+
+
+def fused_moe_int8_smoothquant(
+    hidden_states: torch.Tensor,  # [M, H] bf16/fp16
+    w13: torch.Tensor,  # [E, H, 2I] int8 (kernel layout K=H, N=2I)
+    w2: torch.Tensor,  # [E, I, H] int8 (kernel layout K=I, N=H)
+    w13_scale: torch.Tensor,  # [E, 2I] fp32 per-output-channel
+    w2_scale: torch.Tensor,  # [E, H] fp32 per-output-channel
+    gating_output: torch.Tensor,  # [M, E] routed-expert logits
+    topk: int,
+    renormalize: bool,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Online INT8 W8A8 (per-token activation + per-channel weight) fused MoE
+    forward built on the smoothquant grouped GEMM. Activations are dynamically
+    int8-quantized per token; the gated SiLU is fused in GEMM1 and the routing
+    weights are combined during the GEMM2 scatter. Portable across archs
+    (validated on gfx1151 RDNA3.5, where aiter's fp8/int4 MoE paths are absent).
+    """
+    from aiter.ops.triton.moe.moe_routing.routing import routing
+    from aiter.ops.triton.moe.quant_moe import smoothquant_quantize
+
+    _M, H = hidden_states.shape
+    routing_data, gather_idx, scatter_idx = routing(
+        gating_output, topk, sm_first=not renormalize
+    )
+    gammas = routing_data.gate_scal
+
+    # GEMM1 gate/up projection: per-token int8 activations, no smoothing.
+    no_smooth_h = torch.ones(H, device=hidden_states.device, dtype=torch.float32)
+    x_int8, x_scale = smoothquant_quantize(hidden_states, no_smooth_h)
+    # GEMM1 + fused gated SiLU: w13 columns are interleaved (g,u,g,u,...) at load
+    # so the kernel's _swiglu computes silu(gate)*up directly (alpha=1, no clamp).
+    intermediate = moe_gemm_int8_smoothquant(
+        x_int8,
+        w13,
+        x_scale,
+        w13_scale,
+        None,
+        routing_data,
+        gather_idx,
+        None,
+        None,
+        False,
+        dtype,
+        apply_activation=True,
+        swiglu_add_residual=False,
+        alpha=1.0,
+        limit=None,
+    )
+    inter_dim = intermediate.shape[-1]
+
+    # GEMM2 down projection: per-token int8, scatter + combine via routing weights.
+    no_smooth_i = torch.ones(
+        inter_dim, device=hidden_states.device, dtype=torch.float32
+    )
+    i_int8, i_scale = smoothquant_quantize(intermediate, no_smooth_i)
+    out = moe_gemm_int8_smoothquant(
+        i_int8,
+        w2,
+        i_scale,
+        w2_scale,
+        None,
+        routing_data,
+        None,
+        scatter_idx,
+        gammas,
+        False,
+        dtype,
+        apply_activation=False,
+    )
     return out

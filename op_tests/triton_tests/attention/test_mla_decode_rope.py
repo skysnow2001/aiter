@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import copy
 from typing import Any
 
-import torch
 import pytest
+import torch
 
 from aiter.ops.triton.attention.mla_decode_rope import (
     _decode_grouped_att_m_fwd_rope,
-    decode_attention_fwd_grouped_rope,
     _get_config,
+    decode_attention_fwd_grouped_rope,
 )
 from op_tests.triton_tests.utils.mla_decode_ref import (
     _decode_grouped_att_m_fwd,
@@ -106,7 +107,7 @@ def ref_compute(
     device="cuda",
 ):
     B, H = q.shape[0], q.shape[1]
-    S = kv_indptr[1].item()
+    kv_indptr[1].item()
 
     qk_rope_head_dim = k_input.shape[-1] - kv_lora_rank
 
@@ -184,7 +185,7 @@ def ref_compute_full_fwd(
 ):
 
     B, H = q.shape[0], q.shape[1]
-    S = kv_indptr[1].item()
+    kv_indptr[1].item()
 
     qk_rope_head_dim = k_input.shape[-1] - kv_lora_rank
 
@@ -245,7 +246,9 @@ def ref_compute_full_fwd(
 
 
 def get_config(dtype: torch.dtype):
-    config: dict[str, Any] = _get_config()
+    # _get_config() returns the shared cached dict and the launch helpers
+    # write derived fields into its sub-configs — work on a copy.
+    config: dict[str, Any] = copy.deepcopy(_get_config())
     base_config_key: str = "fwd_grouped_kernel_stage1_rope"
     fp32_config_key: str = f"{base_config_key}_fp32"
     config_key: str = (

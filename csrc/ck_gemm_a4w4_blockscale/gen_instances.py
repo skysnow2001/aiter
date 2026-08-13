@@ -3,13 +3,29 @@
 import argparse
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
-import torch
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = (
+    os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
+    else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
+)
+sys.path.insert(0, AITER_CORE_DIR)
+from chip_info import (
+    build_tune_dict,
+    write_lookup_header,
+    write_name_keyed_lookup_header,
+)
 from gemm_a4w4_blockscale_common import (
     default_kernels_dict,
     kernelInstance,
+    kernels_by_name,
     kernels_list,
 )
 
@@ -64,11 +80,11 @@ torch::Tensor
             {k.AK1}, {k.BK1},
             {k.MPerXDL}, {k.NPerXDL},
             {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
+            S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
             {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
             {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
             {k.CBLOCK_SPV},
             ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
             ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
@@ -135,7 +151,16 @@ template torch::Tensor
             ).write_text(INSTANCE_dFP32_eFP16)
 
     def gen_lookup_dict(self, kernels_dict):
-        LOOKUP_head = """#pragma once
+        """Generate the dispatch lookup header.
+
+        - Tune mode: kernelId-keyed table for *_tune.cu (unchanged).
+        - Non-tune mode: name-keyed registry for the Python-driven dispatch
+          in gemm_a4w4_blockscale.cu.
+        """
+        output_path = os.path.join(self.working_path, "gemm_a4w4_blockscale_lookup.h")
+
+        if self.istune:
+            LOOKUP_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -144,33 +169,49 @@ template torch::Tensor
 #define GENERATE_LOOKUP_TABLE(CTYPE)                                                                                      \\
    {                                                                                                                             \\"""
 
-        LOOKUP_template = """
+            LOOKUP_template = """
        {{{MNK},                                                                                                       \\
         {kernel_name}<CTYPE>}},                       \\"""
 
-        LOOKUP_end = """
+            LOOKUP_end = """
    }
 
 #endif // USE_ROCM
 """
-        with open(
-            os.path.join(self.working_path, "gemm_a4w4_blockscale_lookup.h"), "w"
-        ) as f:
-            f.write(LOOKUP_head)
-            for mnk, k in kernels_dict.items():
-                # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
-                if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(
-                        LOOKUP_template.format(
-                            MNK="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
-                            kernel_name=k.name,
-                        )
-                    )
-                elif self.istune and isinstance(mnk, int):
-                    f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
-            f.write(LOOKUP_end)
+            write_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+                self.istune,
+            )
+        else:
+            LOOKUP_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#define GENERATE_LOOKUP_TABLE(CTYPE)                                                                                      \\
+   {                                                                                                                             \\"""
+
+            LOOKUP_template = """
+       {{"{kernel_name}",                                                                                                       \\
+        {kernel_name}<CTYPE>}},                       \\"""
+
+            LOOKUP_end = """
+   }
+
+#endif // USE_ROCM
+"""
+            write_name_keyed_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+            )
 
     def gen_manifest_head(self, kernels_dict):
         MAINFEST_head = """#pragma once
@@ -203,8 +244,10 @@ torch::Tensor
             os.path.join(self.working_path, "gemm_a4w4_blockscale_manifest.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for mnk, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_instances(self, kernels_dict):
@@ -215,7 +258,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)
@@ -223,23 +266,23 @@ torch::Tensor
 
 
 def get_tune_dict(tune_dict_csv):
-    tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
-        tune_df = pd.read_csv(tune_dict_csv)
-        if torch.cuda.is_available():
-            gpu = torch.cuda.current_device()
-            device_properties = torch.cuda.get_device_properties(gpu)
-            cu_num = device_properties.multi_processor_count
-            tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
-        for i in range(len(tune_df)):
-            M = tune_df.loc[i, "M"]
-            N = tune_df.loc[i, "N"]
-            K = tune_df.loc[i, "K"]
-            kid = tune_df.loc[i, "kernelId"]
-            if kid < 0 or kid > len(kernels_list):
-                continue
-            tune_dict[(M, N, K)] = kernels_list[kid]
-    return tune_dict
+        df = pd.read_csv(tune_dict_csv)
+        # The a4w4 tuned CSV mixes CK kernels and ASM kernels in one file with
+        # no libtype column.  The Python dispatcher in
+        # aiter/ops/gemm_op_a4w4.py routes ASM rows by
+        # kernelName.startswith("_ZN") (mangled C++ symbol of the ASM kernel);
+        # apply the same filter here so the CK codegen sees only CK rows and
+        # build_tune_dict's strict validation stays effective on genuine CK
+        # references.
+        df = df[~df["kernelName"].astype(str).str.startswith("_ZN")]
+        return build_tune_dict(
+            df,
+            default_kernels_dict,
+            kernels_list,
+            kernels_by_name=kernels_by_name,
+        )
+    return default_kernels_dict
 
 
 if __name__ == "__main__":

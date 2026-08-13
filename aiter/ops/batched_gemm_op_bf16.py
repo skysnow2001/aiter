@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
+import pandas as pd
 import torch
 from torch import Tensor
-from typing import Optional
-import functools
-import pandas as pd
+
+from aiter import logger
+
 from ..jit.core import (
-    compile_ops,
-    AITER_ROOT_DIR,
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
+    compile_ops,
 )
-from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
-from aiter import logger
+from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
+from ..utility import dtypes
 
 
 def gen_batched_gemm_bf16_tune_fake_tensor(
@@ -29,7 +31,7 @@ def gen_batched_gemm_bf16_tune_fake_tensor(
     gen_fake=gen_batched_gemm_bf16_tune_fake_tensor,
 )
 def batched_gemm_bf16(
-    XQ: Tensor, WQ: Tensor, out: Tensor, bias: Optional[Tensor] = None, splitK: int = 0
+    XQ: Tensor, WQ: Tensor, out: Tensor, bias: Tensor | None = None, splitK: int = 0
 ) -> Tensor: ...
 
 
@@ -58,13 +60,34 @@ def get_CKBatchedGEMM_config(
         ck_batched_gemm_dict = pd.read_csv(
             AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE
         ).drop_duplicates()
-        get_CKBatchedGEMM_config.ck_batched_gemm_dict = ck_batched_gemm_dict.set_index(
-            ["cu_num", "B", "M", "N", "K"]
-        ).to_dict("index")
+        # Use (gfx, cu_num, B, M, N, K) key when the CSV has a gfx column (new schema).
+        # Fall back to (cu_num, B, M, N, K) for old CSVs that pre-date the gfx column.
+        if "gfx" in ck_batched_gemm_dict.columns:
+            get_CKBatchedGEMM_config.ck_batched_gemm_dict = (
+                ck_batched_gemm_dict.set_index(
+                    ["gfx", "cu_num", "B", "M", "N", "K"]
+                ).to_dict("index")
+            )
+            get_CKBatchedGEMM_config.has_gfx = True
+        else:
+            logger.warning(
+                f"{AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE} has no 'gfx' column — "
+                "falling back to cu_num-only key. Re-run the tuner or migrate the CSV."
+            )
+            get_CKBatchedGEMM_config.ck_batched_gemm_dict = (
+                ck_batched_gemm_dict.set_index(["cu_num", "B", "M", "N", "K"]).to_dict(
+                    "index"
+                )
+            )
+            get_CKBatchedGEMM_config.has_gfx = False
+    gfx = get_gfx()
     cu_num = get_cu_num()
-    config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get(
-        (cu_num, B, M, N, K), None
+    key = (
+        (gfx, cu_num, B, M, N, K)
+        if get_CKBatchedGEMM_config.has_gfx
+        else (cu_num, B, M, N, K)
     )
+    config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get(key, None)
     if config is not None:
         if AITER_LOG_TUNED_CONFIG:
             logger.info(
@@ -84,9 +107,9 @@ def get_CKBatchedGEMM_config(
 def batched_gemm_bf16_CK(
     XQ: Tensor,
     WQ: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype=dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ):
     assert dtype in [
         dtypes.bf16,

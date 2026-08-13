@@ -3,11 +3,26 @@
 import argparse
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
-import torch
-from batched_gemm_a8w8_common import default_kernels_dict, kernelInstance, kernels_list
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = (
+    os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
+    else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
+)
+sys.path.insert(0, AITER_CORE_DIR)
+from batched_gemm_a8w8_common import (
+    default_kernels_dict,
+    kernelInstance,
+    kernels_list,
+)
+from chip_info import build_tune_dict_batched, write_lookup_header
 
 
 class batched_gemm_a8w8_fwd_codegen:
@@ -69,10 +84,10 @@ torch::Tensor
                 {k.WAVE_TILE_N},
                 {k.WAVE_MAP_M},
                 {k.WAVE_MAP_N},
-                S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
+                S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+                S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
+                S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
+                S<{(", ").join(str(x) for x in k.CBLOCK_SPV)}>,
                 {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
                 {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
                 ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
@@ -92,10 +107,10 @@ torch::Tensor
             {k.WAVE_TILE_N},
             {k.WAVE_MAP_M},
             {k.WAVE_MAP_N},
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
+            S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_SPV)}>,
             {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
             {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
             ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
@@ -175,7 +190,7 @@ template torch::Tensor
    {                                                                                                                             \\"""
 
         LOOKUP_template = """
-       {{{mnk},                                                                                                       \\
+       {{{MNK},                                                                                                       \\
         {kernel_name}<DTYPE, ETYPE>}},                       \\"""
 
         LOOKUP_end = """
@@ -183,24 +198,14 @@ template torch::Tensor
 
 #endif // USE_ROCM
 """
-        with open(
-            os.path.join(self.working_path, "batched_gemm_a8w8_lookup.h"), "w"
-        ) as f:
-            f.write(LOOKUP_head)
-            for mnk, k in kernels_dict.items():
-                # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
-                if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(
-                        LOOKUP_template.format(
-                            mnk="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
-                            kernel_name=k.name,
-                        )
-                    )
-                elif self.istune and isinstance(mnk, int):
-                    f.write(LOOKUP_template.format(mnk=mnk, kernel_name=k.name))
-            f.write(LOOKUP_end)
+        write_lookup_header(
+            os.path.join(self.working_path, "batched_gemm_a8w8_lookup.h"),
+            kernels_dict,
+            LOOKUP_head,
+            LOOKUP_template,
+            LOOKUP_end,
+            self.istune,
+        )
 
     def gen_manifest_head(self, kernels_dict):
         MAINFEST_head = """#pragma once
@@ -234,8 +239,10 @@ torch::Tensor
             os.path.join(self.working_path, "batched_gemm_a8w8_manifest.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for mnk, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_instances(self, kernels_dict):
@@ -246,7 +253,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)
@@ -254,22 +261,11 @@ torch::Tensor
 
 
 def get_tune_dict(tune_dict_csv):
-    tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
-        tune_df = pd.read_csv(tune_dict_csv)
-        if torch.cuda.is_available():
-            gpu = torch.cuda.current_device()
-            device_properties = torch.cuda.get_device_properties(gpu)
-            cu_num = device_properties.multi_processor_count
-            tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
-        for i in range(len(tune_df)):
-            B = tune_df.loc[i, "B"]
-            M = tune_df.loc[i, "M"]
-            N = tune_df.loc[i, "N"]
-            K = tune_df.loc[i, "K"]
-            kid = tune_df.loc[i, "kernelId"]
-            tune_dict[(B, M, N, K)] = kernels_list[kid]
-    return tune_dict
+        return build_tune_dict_batched(
+            pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list
+        )
+    return default_kernels_dict
 
 
 if __name__ == "__main__":

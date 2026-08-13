@@ -2,13 +2,14 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-import json
+
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
+
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 DROPOUT_USE_PYTORCH = False
@@ -37,12 +38,16 @@ _bwd_preprocess_repr = make_kernel_repr(
 @triton.jit(repr=_bwd_preprocess_repr)
 def _bwd_preprocess(
     o_ptr,
-    do_ptr,  # noqa: E741
+    do_ptr,
     delta_ptr,
     stride_o_b,
     stride_o_h,
     stride_o_m,
     stride_o_k,
+    stride_do_b,
+    stride_do_h,
+    stride_do_m,
+    stride_do_k,
     stride_delta_b,
     stride_delta_h,
     stride_delta_m,
@@ -75,13 +80,21 @@ def _bwd_preprocess(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BLOCK_D_MODEL_POW2)
 
-    # Offset O/DO by batch, head and q_start
-    offs = (
+    # O and DO may have different strides (e.g. BSHD vs SBHD memory layout),
+    # so address each with its own strides.
+    offs_o = (
         bid * stride_o_b
         + hid * stride_o_h
         + q_start * stride_o_m
         + offs_m[:, None] * stride_o_m
         + offs_k[None, :] * stride_o_k
+    )
+    offs_do = (
+        bid * stride_do_b
+        + hid * stride_do_h
+        + q_start * stride_do_m
+        + offs_m[:, None] * stride_do_m
+        + offs_k[None, :] * stride_do_k
     )
 
     # create masks
@@ -92,8 +105,8 @@ def _bwd_preprocess(
         mask &= offs_k[None, :] < BLOCK_D_MODEL
 
     # load [BLOCK_M, BLOCK_D_MODEL_POW2]
-    o = tl.load(o_ptr + offs, mask=mask, other=0.0)
-    do = tl.load(do_ptr + offs, mask=mask, other=0.0)
+    o = tl.load(o_ptr + offs_o, mask=mask, other=0.0)
+    do = tl.load(do_ptr + offs_do, mask=mask, other=0.0)
 
     # compute and write-back to delta
     if IS_FP8:
@@ -136,8 +149,8 @@ def _bwd_dkdv_inner(
     stride_deltam,
     BLOCK_M: tl.constexpr,  # 16
     BLOCK_N: tl.constexpr,  # 128
-    HEAD_DIM: tl.constexpr,  #
-    ACTUAL_HEAD_DIM: tl.constexpr,  #
+    HEAD_DIM: tl.constexpr,
+    ACTUAL_HEAD_DIM: tl.constexpr,
     PE_HEAD_DIM: tl.constexpr,
     dropout_p,
     philox_seed,
@@ -162,6 +175,7 @@ def _bwd_dkdv_inner(
     FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
@@ -191,7 +205,7 @@ def _bwd_dkdv_inner(
 
     for blk_idx in range(num_steps):
         if DEBUG_TRITON:
-            print(f"iter {blk_idx}: curr_m = {curr_m}")  # noqa: E701
+            print(f"iter {blk_idx}: curr_m = {curr_m}")
         offs_m = curr_m + tl.arange(0, BLOCK_M)
         # update the mask because offs_m advanced
         mask_m = offs_m < seqlen_q
@@ -229,7 +243,7 @@ def _bwd_dkdv_inner(
         else:
             qkT = tl.dot(k, qT)
             if HAS_PE:
-                qkT += tl.dot(k_pe, qT_pe)
+                qkT = tl.dot(k_pe, qT_pe, acc=qkT)
         qkT_scaled = qkT * sm_scale
 
         if USE_ALIBI:
@@ -237,11 +251,10 @@ def _bwd_dkdv_inner(
             alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
             qkT_scaled += alibi_block
 
-        if DEBUG_TRITON_DETAIL:
-            if start_n == 256:
-                print(f"qT: {qT.shape}\n", qT)
-                print(f"k: {k.shape}\n", k)
-                print(f"qkT scaled: {qkT.shape}\n", qkT_scaled)
+        if DEBUG_TRITON_DETAIL and start_n == 256:
+            print(f"qT: {qT.shape}\n", qT)
+            print(f"k: {k.shape}\n", k)
+            print(f"qkT scaled: {qkT.shape}\n", qkT_scaled)
         # TODO: remove the scaling of m later when we removed re-scaling in fwd
         if USE_EXP2:
             pT = tl.math.exp2(qkT_scaled * RCP_LN2 - m[None, :] * RCP_LN2)
@@ -254,14 +267,18 @@ def _bwd_dkdv_inner(
             # bottom right of the (seqlen_q, seqlen_k) matrix
             causal_mask = (offs_m[None, :] - delta_qk) >= offs_n[:, None]
             mask = causal_mask & mask_nm
-            if DEBUG_TRITON_DETAIL:
-                if start_n == 256:
-                    print(f"causal_mask: {causal_mask.shape}\n", causal_mask)
-                    print(
-                        f"qkT after causal: {qkT.shape}\n",
-                        tl.where(causal_mask, qkT * sm_scale, 0.0),
-                    )
+            if DEBUG_TRITON_DETAIL and start_n == 256:
+                print(f"causal_mask: {causal_mask.shape}\n", causal_mask)
+                print(
+                    f"qkT after causal: {qkT.shape}\n",
+                    tl.where(causal_mask, qkT * sm_scale, 0.0),
+                )
             pT = tl.where(mask, pT, 0.0)
+        if SLIDING_WINDOW > 0:
+            window_mask = offs_n[:, None] >= (
+                offs_m[None, :] - delta_qk - SLIDING_WINDOW
+            )
+            pT = tl.where(window_mask, pT, 0.0)
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
         # Compute dV.
         if ENABLE_DROPOUT:
@@ -276,7 +293,7 @@ def _bwd_dkdv_inner(
                     * descale_do
                 )
             else:
-                dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+                dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
         else:
             if IS_FP8:
                 scale_pT, descale_pT = _compute_fp8_scaling_factors(pT, FP8_MAX)
@@ -286,11 +303,10 @@ def _bwd_dkdv_inner(
                     * descale_do
                 )
             else:
-                dv += tl.dot(pT.to(do.type.element_ty), do)
+                dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
-        if DEBUG_TRITON_DETAIL:
-            if start_n == 256:
-                print(f"pT: {pT.shape}\n", pT)
+        if DEBUG_TRITON_DETAIL and start_n == 256:
+            print(f"pT: {pT.shape}\n", pT)
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
         # Compute dP and dS.
@@ -310,9 +326,11 @@ def _bwd_dkdv_inner(
                 * descale_q
             )
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
             if HAS_PE:
-                dk_pe += tl.dot(dsT.to(qT_pe.type.element_ty), tl.trans(qT_pe))
+                dk_pe = tl.dot(
+                    dsT.to(qT_pe.type.element_ty), tl.trans(qT_pe), acc=dk_pe
+                )
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
@@ -345,11 +363,11 @@ def _bwd_dq_inner(
     stride_dropoutm,
     stride_dropoutn,  # stride for dropout
     seqlen_q,
-    seqlen_k,  #
-    BLOCK_M2: tl.constexpr,  #
-    BLOCK_N2: tl.constexpr,  #
+    seqlen_k,
+    BLOCK_M2: tl.constexpr,
+    BLOCK_N2: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    ACTUAL_HEAD_DIM: tl.constexpr,  #
+    ACTUAL_HEAD_DIM: tl.constexpr,
     PE_HEAD_DIM: tl.constexpr,
     dropout_p,
     philox_seed,
@@ -360,7 +378,7 @@ def _bwd_dq_inner(
     start_m,
     start_n,
     end_n,
-    num_steps,  #
+    num_steps,
     descale_q,
     descale_k,
     descale_v,
@@ -373,6 +391,8 @@ def _bwd_dq_inner(
     FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    ENABLE_SINK: tl.constexpr,
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
@@ -398,9 +418,10 @@ def _bwd_dq_inner(
     curr_philox_offset = batch_philox_offset
     curr_dropout_offset = dropout_offset
     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
+    delta_recomp = tl.zeros([BLOCK_M2], dtype=tl.float32)
     for blk_idx in range(num_steps):
         if DEBUG_TRITON:
-            print(f"iter {blk_idx}: curr_n = {curr_n}")  # noqa: E701
+            print(f"iter {blk_idx}: curr_n = {curr_n}")
         offs_n = curr_n + tl.arange(0, BLOCK_N2)
         # end_n is needed because the end of causal True might not be perfectly
         # aligned with the end of the block
@@ -408,9 +429,9 @@ def _bwd_dq_inner(
         if DEBUG_TRITON_DETAIL:
             print(
                 f"start_n = {start_n}, end_n = {end_n}, offs_n: {offs_n.shape}\n{offs_n}"
-            )  # noqa: E701
+            )
         if DEBUG_TRITON_DETAIL:
-            print(f"mask_n: {mask_n.shape}\n{mask_n}")  # noqa: E701
+            print(f"mask_n: {mask_n.shape}\n{mask_n}")
         mask_kT = mask_n[None, :]
         mask_mn = mask_m[:, None] & (offs_n[None, :] < end_n)
         if PADDED_HEAD:
@@ -444,7 +465,7 @@ def _bwd_dq_inner(
         else:
             qk = tl.dot(q, kT)
             if HAS_PE:
-                qk += tl.dot(q_pe, kT_pe)
+                qk = tl.dot(q_pe, kT_pe, acc=qk)
         qk_scaled = qk * sm_scale
 
         if USE_ALIBI:
@@ -453,7 +474,7 @@ def _bwd_dq_inner(
             qk_scaled += alibi_block
 
         if DEBUG_TRITON_DETAIL:
-            print(f"qk scaled: {qk.shape}\n", qk_scaled)  # noqa: E701
+            print(f"qk scaled: {qk.shape}\n", qk_scaled)
         if USE_EXP2:
             p = tl.math.exp2(qk_scaled * RCP_LN2 - m * RCP_LN2)
         else:
@@ -464,6 +485,11 @@ def _bwd_dq_inner(
             causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
             mask = causal_mask & mask_mn
             p = tl.where(mask, p, 0.0)
+        if SLIDING_WINDOW > 0:
+            window_mask = offs_n[None, :] >= (
+                offs_m[:, None] - delta_qk - SLIDING_WINDOW
+            )
+            p = tl.where(window_mask, p, 0.0)
         # Compute dP and dS.
         if IS_FP8:
             dp = tl.dot(do, vT) * descale_do * descale_v
@@ -471,6 +497,9 @@ def _bwd_dq_inner(
             dp = tl.dot(do, vT)
         if ENABLE_DROPOUT:
             dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
+        if ENABLE_SINK:
+            # Equal to do_i . o_i but skips the bf16 round-trip through forward `o`.
+            delta_recomp += tl.sum(p * dp, axis=1)
         delta_i = Di[:, None]
         ds = p * (dp - delta_i)
         # Compute dQ.
@@ -483,16 +512,16 @@ def _bwd_dq_inner(
                 * descale_k
             )
         else:
-            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
+            dq = tl.dot(ds.to(kT.type.element_ty), tl.trans(kT), acc=dq)
             if HAS_PE:
-                dq_pe += tl.dot(ds.to(kT_pe.type.element_ty), tl.trans(kT_pe))
+                dq_pe = tl.dot(ds.to(kT_pe.type.element_ty), tl.trans(kT_pe), acc=dq_pe)
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
         if HAS_PE:
             kT_pe_ptrs += step_n * stride_kn
         vT_ptrs += step_n * stride_vn
-    return dq, dq_pe
+    return dq, dq_pe, delta_recomp
 
 
 _bwd_kernel_causal_repr = make_kernel_repr(
@@ -511,6 +540,7 @@ _bwd_kernel_causal_repr = make_kernel_repr(
         "IS_FP8",
         "USE_INT64_STRIDES",
         "ENABLE_SINK",
+        "SLIDING_WINDOW",
     ],
 )
 
@@ -603,6 +633,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
     ENABLE_SINK: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
         stride_qb = tl.cast(stride_qb_in, tl.int64)
@@ -697,7 +728,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     pid = tl.program_id(1)
     bid = tl.program_id(2)
     if DEBUG_TRITON:
-        print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")  # noqa: E701
+        print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")
     # figure out varlen start and end
     q_start = 0
     k_start = 0
@@ -714,7 +745,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
 
     delta_qk = seqlen_q - seqlen_k
     if DEBUG_TRITON:
-        print(f"delta_qk = {delta_qk}")  # noqa: E701
+        print(f"delta_qk = {delta_qk}")
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
     HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
     offs_d = tl.arange(0, HEAD_DIM)
@@ -748,13 +779,13 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             if DEBUG_TRITON:
                 print(
                     f"q >= k: start_delta = delta_qk aligned to BLOCK_M = {start_delta_q_gt_k}"
-                )  # noqa: E701
+                )
         else:
             start_delta = start_delta_q_lt_k
             if DEBUG_TRITON:
                 print(
                     f"q < k: start_delta = residue btw multiple BLOCK_N and delta_qk = {delta_aligned} = aligned to BLOCK_M = {start_delta_q_lt_k}"
-                )  # noqa: E701
+                )
 
         offs_n = start_n + tl.arange(0, BLOCK_N1)
         # Mask for loading K and V
@@ -808,7 +839,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 residue_m = max(start_n + delta_qk - start_m, 0)
                 len_m = BLOCK_N1 + residue_m
                 if DEBUG_TRITON:
-                    print(f"residue_m = {residue_m}")  # noqa: E701
+                    print(f"residue_m = {residue_m}")
 
             # offset input and output tensor by batch and Q/K heads
             adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
@@ -860,7 +891,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             if DEBUG_TRITON:
                 print(
                     f"Masked: start_n: {start_n}; start_m: {start_m}, num_steps: {num_steps}"
-                )  # noqa: E701
+                )
             dk, dk_pe, dv = _bwd_dkdv_inner(
                 dk,  # output tensor
                 dk_pe,  # optional output tensor
@@ -907,21 +938,23 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
             )
             start_m += num_steps * MASK_BLOCK_M1
-            num_steps = tl.cdiv(seqlen_q - start_m, BLOCK_M1)
+            end_m = seqlen_q
+            if SLIDING_WINDOW > 0:
+                end_m = min(start_n + BLOCK_N1 + delta_qk + SLIDING_WINDOW, seqlen_q)
+            num_steps = tl.cdiv(max(end_m - start_m, 0), BLOCK_M1)
             end_m = start_m + num_steps * BLOCK_M1
 
             if DEBUG_TRITON:
-                print(
-                    f"start_m after Masked step: {start_m}; num_steps: {num_steps}"
-                )  # noqa: E701
+                print(f"start_m after Masked step: {start_m}; num_steps: {num_steps}")
             if DEBUG_TRITON:
                 print(
                     f"unMasked: start_n: {start_n}, start_m: {start_m}, end_m: {end_m}, num_steps: {num_steps}"
-                )  # noqa: E701
+                )
             if DEBUG_TRITON:
-                print("unMasked")  # noqa: E701
+                print("unMasked")
             dk, dk_pe, dv = _bwd_dkdv_inner(
                 dk,  # output tensor
                 dk_pe,  # optional output tensor
@@ -968,6 +1001,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
             )
         # end of GQA/MQA of dkdv
         # Write back dV
@@ -991,12 +1025,12 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         if DEBUG_TRITON:
             print(
                 f"end_n = start_m + BLOCK_M = {start_m} + {BLOCK_M2} = {start_m + BLOCK_M2}"
-            )  # noqa: E701
+            )
         if start_m + BLOCK_M2 < delta_qk:
             if DEBUG_TRITON:
                 print(
                     f"start_m + BLOCK_M2 = {start_m} + {BLOCK_M2} = {start_m + BLOCK_M2} < delta_qk of {delta_qk}"
-                )  # noqa: E701
+                )
             return
 
         offs_m = start_m + tl.arange(0, BLOCK_M2)
@@ -1021,7 +1055,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             # clamp end_n at [0, seqlen_k]
             end_n = max(min(end_n, seqlen_k), 0)
             if DEBUG_TRITON:
-                print(f"delta_qk: {delta_qk}; end_n: {end_n}")  # noqa: E701
+                print(f"delta_qk: {delta_qk}; end_n: {end_n}")
             # offset input and output tensor by batch and Q/K heads
             adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
             adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
@@ -1058,16 +1092,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             m = m[:, None]
             delta = tl.load(Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0)
 
-            if ENABLE_SINK:
-                sink = tl.load(Sink + hqid).to(tl.float32)
-                if USE_EXP2:
-                    RCP_LN2: tl.constexpr = 1.4426950408889634
-                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
-                else:
-                    psink = tl.math.exp(sink - m)
-                dsink = tl.sum(-psink * delta[:, None])
-                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
-
             MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
             # start can only be 0 at minimum
             start_n = max(end_n - BLOCK_M2, 0)
@@ -1086,7 +1110,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
             else:
                 dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
-            dq, dq_pe = _bwd_dq_inner(
+            dq, dq_pe, delta_recomp_masked = _bwd_dq_inner(
                 dq,  # output tensor
                 dq_pe,  # optional output tensor
                 q,
@@ -1125,7 +1149,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 descale_k,
                 descale_v,
                 descale_do,
-                MASK=True,  #
+                MASK=True,
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
@@ -1133,15 +1157,20 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                ENABLE_SINK=ENABLE_SINK,
             )
             end_n -= num_steps * MASK_BLOCK_N2
-            num_steps = tl.cdiv(end_n, BLOCK_N2)
-            start_n = max(end_n - num_steps * BLOCK_N2, 0)
+            window_start_n = 0
+            if SLIDING_WINDOW > 0:
+                window_start_n = max(start_m - delta_qk - SLIDING_WINDOW, 0)
+            start_n = window_start_n // BLOCK_N2 * BLOCK_N2
+            num_steps = tl.cdiv(max(end_n - start_n, 0), BLOCK_N2)
             if DEBUG_TRITON:
                 print(
                     f"unMasked: start_m: {start_m}, start_n: {start_n}, end_n: {end_n}, num_steps: {num_steps}"
-                )  # noqa: E701
-            dq, dq_pe = _bwd_dq_inner(
+                )
+            dq, dq_pe, delta_recomp_unmasked = _bwd_dq_inner(
                 dq,  # output tensor
                 dq_pe,  # optional output tensor
                 q,
@@ -1188,7 +1217,19 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                ENABLE_SINK=ENABLE_SINK,
             )
+            if ENABLE_SINK:
+                sink = tl.load(Sink + hqid).to(tl.float32)
+                if USE_EXP2:
+                    RCP_LN2: tl.constexpr = 1.4426950408889634
+                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
+                else:
+                    psink = tl.math.exp(sink - m)
+                delta_recomp = delta_recomp_masked + delta_recomp_unmasked
+                dsink = tl.sum(-psink * delta_recomp[:, None])
+                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
@@ -1219,6 +1260,7 @@ _bwd_kernel_noncausal_repr = make_kernel_repr(
         "IS_FP8",
         "USE_INT64_STRIDES",
         "ENABLE_SINK",
+        "SLIDING_WINDOW",
     ],
 )
 
@@ -1311,6 +1353,7 @@ def bwd_kernel_noncausal(
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
     ENABLE_SINK: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
         stride_qb = tl.cast(stride_qb_in, tl.int64)
@@ -1405,7 +1448,7 @@ def bwd_kernel_noncausal(
     pid = tl.program_id(1)
     bid = tl.program_id(2)
     if DEBUG_TRITON:
-        print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")  # noqa: E701
+        print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")
     # figure out varlen start and end
     q_start = 0
     k_start = 0
@@ -1543,7 +1586,7 @@ def bwd_kernel_noncausal(
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
-                dropout_offset,  #
+                dropout_offset,
                 alibi_slope,
                 seqlen_q,
                 seqlen_k,  # max sequence length for q and k
@@ -1562,6 +1605,7 @@ def bwd_kernel_noncausal(
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
             )
 
         # Write back dV
@@ -1632,16 +1676,6 @@ def bwd_kernel_noncausal(
             m = m[:, None]
             delta = tl.load(Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0)
 
-            if ENABLE_SINK:
-                sink = tl.load(Sink + hqid).to(tl.float32)
-                if USE_EXP2:
-                    RCP_LN2: tl.constexpr = 1.4426950408889634
-                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
-                else:
-                    psink = tl.math.exp(sink - m)
-                dsink = tl.sum(-psink * delta[:, None])
-                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
-
             if IS_FP8:
                 descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
@@ -1660,7 +1694,7 @@ def bwd_kernel_noncausal(
                 dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
             else:
                 dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
-            dq, dq_pe = _bwd_dq_inner(
+            dq, dq_pe, delta_recomp = _bwd_dq_inner(
                 dq,  # output tensor
                 dq_pe,  # optional output tensor
                 q,
@@ -1707,7 +1741,18 @@ def bwd_kernel_noncausal(
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                ENABLE_SINK=ENABLE_SINK,
             )
+            if ENABLE_SINK:
+                sink = tl.load(Sink + hqid).to(tl.float32)
+                if USE_EXP2:
+                    RCP_LN2: tl.constexpr = 1.4426950408889634
+                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
+                else:
+                    psink = tl.math.exp(sink - m)
+                dsink = tl.sum(-psink * delta_recomp[:, None])
+                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
@@ -1723,12 +1768,6 @@ def bwd_kernel_noncausal(
 
 @functools.lru_cache(maxsize=1024)
 def _get_config():
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
-
-    return _get_config._config_dict["bkwd_onekernel"]
+    dev = arch_info.get_arch()
+    config = load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json")
+    return config["bkwd_onekernel"]

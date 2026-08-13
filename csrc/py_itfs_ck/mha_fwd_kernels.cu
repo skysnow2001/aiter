@@ -109,7 +109,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         static_cast<int>(bias_type),
                         has_lse,
                         static_cast<int>(qscale_type),
-                        mask.sink > 0, // has_sink
+                        (mask.sink > 0) || (sink_ptr != nullptr), // has_sink: true for streaming-sink window OR a learned per-head sink_ptr (e.g. gpt-oss, sink_size==0)
                         q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),
@@ -312,6 +312,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
 
     // Otherwise the kernel will be launched from cuda:0 device
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     bool has_lse = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
@@ -344,12 +345,11 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         auto philox_args = gen->philox_cuda_state(counter_offset);
         hipLaunchKernelGGL(
-            aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
+            aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, stream, philox_args, rng_state_ptr);
     }
 
     if (seqlen_k > 0) {
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
-        auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
         auto args =

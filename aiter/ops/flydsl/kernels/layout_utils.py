@@ -3,10 +3,14 @@
 Parses fly layout type strings (e.g. '(4,64):(64,1)') and computes
 idx2crd / crd2idx with plain arith ops for static layouts.
 Falls back to fly dialect ops for dynamic layouts.
+
+Optimisation: power-of-2 strides/shapes emit ``shrui`` / ``andi`` instead of
+``divui`` / ``remui``, avoiding 10-15-cycle V_DIV sequences on CDNA GPUs.
 """
 
-import re
 import builtins as _builtins
+import math as _math
+import re
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -22,6 +26,30 @@ def _wrap(v):
     if isinstance(v, ir.Value):
         return ArithValue(v)
     return v
+
+
+def _is_pow2(n):
+    """Return True when *n* is a positive power of two."""
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _div_pow2(val, divisor):
+    """Unsigned divide index *val* by a **compile-time** power-of-2 *divisor*.
+
+    Emits ``arith.shrui`` (1 VALU cycle) instead of ``arith.divui``
+    (10-15 VALU cycles on CDNA).
+    """
+    shift = _math.log2(divisor)
+    assert shift == int(shift), f"{divisor} is not a power of 2"
+    return arith.shrui(val, arith.index(int(shift)))
+
+
+def _mod_pow2(val, modulus):
+    """Unsigned remainder of index *val* by a **compile-time** power-of-2 *modulus*.
+
+    Emits ``arith.andi`` (1 VALU cycle) instead of ``arith.remui``.
+    """
+    return arith.andi(val, arith.index(modulus - 1))
 
 
 def _parse_dim(tok):
@@ -50,16 +78,20 @@ def idx2crd(idx, layout):
     """Decompose flat index into a list of coordinate values.
 
     For static layouts, computes coordinates with plain arith ops.
+    Power-of-2 strides/shapes use shift/mask instead of div/rem.
     For dynamic layouts, falls back to fx.idx2crd + fx.get.
     """
     parsed = _parse_layout(layout)
 
+    if hasattr(idx, "ir_value"):
+        idx = idx.ir_value()
+
     if parsed is None or _has_dynamic_strides(parsed[1]):
-        result = fx.idx2crd(idx, layout)
+        result = fx.idx2crd(fx.Int32(idx), layout)
         ndims = len(parsed[1]) if parsed else 1
         return [_wrap(fx.get(result, i)) for i in range(ndims)]
 
-    if hasattr(idx, "type") and str(idx.type) != "index":
+    if isinstance(idx, ir.Value) and not isinstance(idx.type, ir.IndexType):
         idx = arith.index_cast(T.index, idx)
     shapes, strides = parsed
     ndims = len(strides)
@@ -76,9 +108,17 @@ def idx2crd(idx, layout):
     coords = [None] * ndims
     remaining = idx
     for i, stride_val, size_val in ordered:
-        c = remaining / arith.index(stride_val)
+        if stride_val == 1:
+            c = remaining
+        elif _is_pow2(stride_val):
+            c = _div_pow2(remaining, stride_val)
+        else:
+            c = remaining / arith.index(stride_val)
         if size_val is not None:
-            c = c % arith.index(size_val)
+            if _is_pow2(size_val):
+                c = _mod_pow2(c, size_val)
+            else:
+                c = c % arith.index(size_val)
         coords[i] = c
     for i in range(ndims):
         if coords[i] is None:
@@ -107,9 +147,8 @@ def crd2idx(crd, layout):
                 cv = arith.index_cast(T.i32, cv)
             crd_i32.append(cv)
         coord_val = fx.make_coord(*crd_i32)
-        result = fx.crd2idx(coord_val, layout)
-        scalar = fx.get_scalar(result)
-        if isinstance(scalar, ir.Value) and not isinstance(scalar.type, ir.IndexType):
+        scalar = fx.get_scalar(fx.crd2idx(coord_val, layout)).ir_value()
+        if not isinstance(scalar.type, ir.IndexType):
             scalar = arith.index_cast(T.index, scalar)
         return _wrap(scalar)
 

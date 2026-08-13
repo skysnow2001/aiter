@@ -1,19 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
-import os
-import sys
-from dataclasses import dataclass
-import copy
-from pathlib import Path
-import pandas as pd
 import argparse
+import os
 import shutil
-import torch
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = (
+    os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
+    else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
+)
+sys.path.insert(0, AITER_CORE_DIR)
+from chip_info import build_tune_dict, write_lookup_header
 from gemm_a8w8_bpreshuffle_cktile_common import (
-    kernelInstance,
-    kernels_list,
     default_kernels_dict,
+    kernelInstance,
     kernels_by_name,
+    kernels_list,
 )
 
 """
@@ -43,7 +52,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    int KBatch = 1
     )
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
@@ -51,55 +61,76 @@ torch::Tensor
     // Check if this input needs to be padded.
     int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
     int N = WQ.size(0);
-    int K = WQ.size(1);
-    bool pad = (M % {k.MTile} != 0) || (N % {k.NTile} != 0) || (K % ({k.KTile}) != 0);
-    if (pad)
+    int K = XQ.size(1);
+    bool pad_m = M % {k.MTile} != 0;
+    bool pad_n = N % {k.NTile} != 0;
+    bool pad_k = K % ({k.KTile}) != 0;
+    if (pad_m && pad_n && pad_k)
     {{{{
-        // pad
-        {{INSTANCE_CONTENT_pad}}
-        // pad
+        {{INSTANCE_CONTENT_pad_mnk}}
+    }}}}
+    else if (pad_m && pad_n)
+    {{{{
+        {{INSTANCE_CONTENT_pad_mn}}
+    }}}}
+    else if (pad_m && pad_k)
+    {{{{
+        {{INSTANCE_CONTENT_pad_mk}}
+    }}}}
+    else if (pad_n && pad_k)
+    {{{{
+        {{INSTANCE_CONTENT_pad_nk}}
+    }}}}
+    else if (pad_m)
+    {{{{
+        {{INSTANCE_CONTENT_pad_m}}
+    }}}}
+    else if (pad_n)
+    {{{{
+        {{INSTANCE_CONTENT_pad_n}}
+    }}}}
+    else if (pad_k)
+    {{{{
+        {{INSTANCE_CONTENT_pad_k}}
     }}}}
     else
     {{{{
-        // no pad
         {{INSTANCE_CONTENT_nopad}}
-        // no pad
     }}}}
 }}}}
 
 """
 
-        INSTANCE_CONTENT_nobias = f"""using FlatmmInstance = CustomConfig<
+        def instance_content(pad_m: bool, pad_n: bool, pad_k: bool) -> str:
+            return f"""using FlatmmInstance = CustomConfig<
             DDataType, EDataType,
             {k.sTransposeC},{k.sUseStructuredSparsity}, {k.sTileParitionerGroupNum},
             {k.sTileParitionerM01}, {k.sNumWaveGroups}, {k.sDoubleSmemBuffer},
-            {k.PadM},  {k.PadN},  {k.PadK},
+            {int(pad_m)},  {int(pad_n)},  {int(pad_k)},
             {k.BlockPerCu},
             {k.MTile}, {k.NTile}, {k.KTile},
             {k.MWarp}, {k.NWarp}, {k.KWarp},
             {k.MWTile}, {k.NWTile}, {k.KWTile},
             ck_tile::GemmPipelineScheduler::{k.sScheduler}>;
         // Run kernel instance.
-        return gemm_a8w8_bpreshuffle_cktile_impl<DDataType, EDataType, FlatmmInstance>(XQ, WQ, x_scale, w_scale, Y);
+        return gemm_a8w8_bpreshuffle_cktile_impl<DDataType, EDataType, FlatmmInstance>(XQ, WQ, x_scale, w_scale, Y, KBatch);
 """
+
+        INSTANCE_CONTENT_nopad = instance_content(k.PadM, k.PadN, k.PadK)
+        instance_replacements = {
+            "INSTANCE_CONTENT_nopad": INSTANCE_CONTENT_nopad,
+            "INSTANCE_CONTENT_pad_m": instance_content(True, k.PadN, k.PadK),
+            "INSTANCE_CONTENT_pad_n": instance_content(k.PadM, True, k.PadK),
+            "INSTANCE_CONTENT_pad_k": instance_content(k.PadM, k.PadN, True),
+            "INSTANCE_CONTENT_pad_mn": instance_content(True, True, k.PadK),
+            "INSTANCE_CONTENT_pad_mk": instance_content(True, k.PadN, True),
+            "INSTANCE_CONTENT_pad_nk": instance_content(k.PadM, True, True),
+            "INSTANCE_CONTENT_pad_mnk": instance_content(True, True, True),
+        }
         if self.istune:
-            INSTANCE_IMPL_str = INSTANCE_IMPL.format(
-                INSTANCE_CONTENT_pad=(
-                    INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding")
-                ),
-                INSTANCE_CONTENT_nopad=(
-                    INSTANCE_CONTENT_nobias.format(GemmSpec="Default")
-                ),
-            )
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(**instance_replacements)
         else:
-            INSTANCE_IMPL_str = INSTANCE_IMPL.format(
-                INSTANCE_CONTENT_pad=INSTANCE_CONTENT_nobias.format(
-                    GemmSpec="MNKPadding"
-                ),
-                INSTANCE_CONTENT_nopad=INSTANCE_CONTENT_nobias.format(
-                    GemmSpec="Default"
-                ),
-            )
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(**instance_replacements)
 
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
             INSTANCE_IMPL_str
@@ -116,7 +147,8 @@ template torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    int KBatch
     );
 
 """
@@ -155,25 +187,14 @@ template torch::Tensor
 
 #endif // USE_ROCM
 """
-        with open(
+        write_lookup_header(
             os.path.join(self.working_path, "gemm_a8w8_bpreshuffle_cktile_lookup.h"),
-            "w",
-        ) as f:
-            f.write(LOOKUP_head)
-            for mnk, k in kernels_dict.items():
-                # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
-                if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(
-                        LOOKUP_template.format(
-                            MNK="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
-                            kernel_name=k.name,
-                        )
-                    )
-                elif self.istune and isinstance(mnk, int):
-                    f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
-            f.write(LOOKUP_end)
+            kernels_dict,
+            LOOKUP_head,
+            LOOKUP_template,
+            LOOKUP_end,
+            self.istune,
+        )
 
     def gen_manifest_head(self, kernels_dict):
         MAINFEST_head = """#pragma once
@@ -194,7 +215,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y);
+    torch::Tensor &Y,
+    int KBatch);
 """
         MAINFEST_end = """
 
@@ -206,8 +228,10 @@ torch::Tensor
             "w",
         ) as f:
             f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for mnk, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_instances(self, kernels_dict):
@@ -218,7 +242,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)
@@ -226,41 +250,15 @@ torch::Tensor
 
 
 def get_tune_dict(tune_dict_csv):
-    tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
-        tune_df = pd.read_csv(tune_dict_csv)
-        if torch.cuda.is_available():
-            gpu = torch.cuda.current_device()
-            device_properties = torch.cuda.get_device_properties(gpu)
-            cu_num = device_properties.multi_processor_count
-            tune_df = tune_df[(tune_df["cu_num"] == cu_num)].reset_index()
-        tune_df = tune_df[tune_df["libtype"] == "cktile"].reset_index()
-        # NOTE: Matching by kernelName (not kernelId). The kernelId column in tuned
-        # CSVs is kept but it is NOT used for kernel selection anymore.
-        # This allows instance lists to be reordered or expanded (e.g. changing
-        # BLOCK_PER_CU_MAX) without invalidating existing tuned CSVs.
-        use_name = "kernelName" in tune_df.columns
-        if not use_name:
-            print(
-                "[Warning]: tuned CSV has no kernelName column, falling back to kernelId. "
-            )
-        for i in range(len(tune_df)):
-            M = tune_df.loc[i, "M"]
-            N = tune_df.loc[i, "N"]
-            K = tune_df.loc[i, "K"]
-            if use_name:
-                kname = str(tune_df.loc[i, "kernelName"])
-                if kname in kernels_by_name:
-                    tune_dict[(M, N, K)] = kernels_by_name[kname]
-                else:
-                    print(f"[Warning]: kernelName '{kname}' not found, skip it")
-            else:
-                kid = tune_df.loc[i, "kernelId"]
-                if kid < 0 or kid >= len(kernels_list):
-                    print(f"[Warning]: kernelId {kid} is out of range, skip it")
-                    continue
-                tune_dict[(M, N, K)] = kernels_list[kid]
-    return tune_dict
+        return build_tune_dict(
+            pd.read_csv(tune_dict_csv),
+            default_kernels_dict,
+            kernels_list,
+            libtype="cktile",
+            kernels_by_name=kernels_by_name,
+        )
+    return default_kernels_dict
 
 
 if __name__ == "__main__":

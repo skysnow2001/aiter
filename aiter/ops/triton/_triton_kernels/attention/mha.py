@@ -2,16 +2,19 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-import json
+
 import torch
 import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+from aiter.ops.triton.utils._triton.pid_preprocessing import (
+    remap_workgroup_spatial,
+    remap_xcd,
+)
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 
 
 @triton.jit
@@ -119,6 +122,7 @@ def _attn_fwd_inner(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
     ENABLE_PIPELINING: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
     HAS_PE: tl.constexpr = BLOCK_DMODEL_PE > 0
@@ -177,8 +181,8 @@ def _attn_fwd_inner(
         # -- compute qk ----
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if HAS_PE:
-            qk += tl.dot(q_pe, k_pe)
-        qk += tl.dot(q, k)
+            qk = tl.dot(q_pe, k_pe, acc=qk)
+        qk = tl.dot(q, k, acc=qk)
         if IS_FP8:
             qk = qk * (qk_scale * descale_q * descale_k)
         else:
@@ -187,6 +191,12 @@ def _attn_fwd_inner(
             causal_boundary = start_n + offs_n_causal
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
             mask = mask & causal_mask
+
+        if SLIDING_WINDOW > 0:
+            k_pos = start_n + tl.arange(0, BLOCK_N)
+            q_adj = OFFS_M + seqlen_k - seqlen_q
+            window_mask = k_pos[None, :] >= (q_adj[:, None] - SLIDING_WINDOW)
+            mask = mask & window_mask
 
         qk = tl.where(mask, qk, float("-inf"))
 
@@ -203,6 +213,11 @@ def _attn_fwd_inner(
 
         # Compute scaled QK and softmax probabilities
         p = tl.math.exp2(qk - m_ij[:, None])
+
+        if SLIDING_WINDOW > 0:
+            # When all qk in a row are -inf (fully out-of-window block) and m_i was -inf,
+            # exp2(-inf - (-inf)) = NaN. Sanitize by zeroing masked elements.
+            p = tl.where(mask, p, 0.0)
 
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
@@ -227,6 +242,10 @@ def _attn_fwd_inner(
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
         alpha = tl.math.exp2(m_i - m_ij)
+        if SLIDING_WINDOW > 0:
+            # When m_i == m_ij == -inf, exp2(-inf - (-inf)) = NaN. alpha should be 1.0
+            # (no rescaling needed since max didn't change).
+            alpha = tl.where(m_i == m_ij, 1.0, alpha)
         acc = acc * alpha[:, None]
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
@@ -240,7 +259,7 @@ def _attn_fwd_inner(
                 tl.dot((p * scale_p).to(v.type.element_ty), v) * descale_p * descale_v
             )
         else:
-            acc += tl.dot(p.to(v.type.element_ty), v)
+            acc = tl.dot(p.to(v.type.element_ty), v, acc=acc)
 
         k_ptrs += BLOCK_N * stride_kn
         if HAS_PE:
@@ -272,6 +291,7 @@ _attn_fwd_repr = make_kernel_repr(
         "NUM_XCD",
         "USE_INT64_STRIDES",
         "ENABLE_SINK",
+        "SLIDING_WINDOW",
     ],
 )
 
@@ -342,8 +362,11 @@ def _attn_fwd(
     VARLEN: tl.constexpr,
     BATCH,
     NUM_XCD: tl.constexpr,
+    SWIZZLE: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
     ENABLE_SINK: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    HEAD_STRIDE_ALIGNED_8: tl.constexpr = False,
 ):
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
@@ -352,10 +375,22 @@ def _attn_fwd(
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
     # num blocks along seqlen
 
-    off_q_head = wid % NUM_Q_HEADS
-    off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
-    start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
-    off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    tl.static_assert(
+        SWIZZLE == "default" or SWIZZLE == "spatial",
+        "SWIZZLE must be 'default' or 'spatial'; set via AITER_TRITON_MHA_SWIZZLE or mha_set_swizzle()",
+    )
+    if SWIZZLE == "default":
+        # Default: head-first round-robin with XCD-aware head remapping.
+        off_q_head = wid % NUM_Q_HEADS
+        off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
+        start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
+        off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    else:
+        # Spatial: XCD-aware KV-head mapping for MHA and GQA.
+        NUM_QUERIES_PER_KV: tl.constexpr = NUM_Q_HEADS // NUM_K_HEADS
+        off_q_head, start_m, off_z = remap_workgroup_spatial(
+            wid, NUM_Q_HEADS, NUM_BLOCKS, BATCH, NUM_QUERIES_PER_KV, NUM_XCD
+        )
 
     # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -546,9 +581,22 @@ def _attn_fwd(
         off_k_head = off_q_head
 
     # q,k,v offsets
+    # When the caller guarantees that the head-axis strides of Q/K/V are
+    # multiples of 8 elements (set via HEAD_STRIDE_ALIGNED_8), the head-axis
+    # byte offset is 16-byte aligned. Auto-specialization only fires at the
+    # 16-element threshold, so hint the smaller multiple explicitly to let
+    # AxisInfo widen the global load.
+    qh_off = off_q_head * stride_qh
+    kh_off = off_k_head * stride_kh
+    vh_off = off_k_head * stride_vh
+    if HEAD_STRIDE_ALIGNED_8:
+        qh_off = tl.multiple_of(qh_off, 8)
+        kh_off = tl.multiple_of(kh_off, 8)
+        vh_off = tl.multiple_of(vh_off, 8)
+
     q_offs = (
         off_z * stride_qz
-        + off_q_head * stride_qh
+        + qh_off
         + cu_seqlens_q_start * stride_qm
         + offs_m[:, None] * stride_qm
         + offs_d[None, :] * stride_qk
@@ -557,7 +605,7 @@ def _attn_fwd(
     if HAS_PE:
         q_pe_offs = (
             off_z * stride_qz
-            + off_q_head * stride_qh
+            + qh_off
             + cu_seqlens_q_start * stride_qm
             + offs_m[:, None] * stride_qm
             + offs_pe[None, :] * stride_qk
@@ -568,7 +616,7 @@ def _attn_fwd(
 
     k_offs = (
         off_z * stride_kz
-        + off_k_head * stride_kh
+        + kh_off
         + cu_seqlens_k_start * stride_kn
         + offs_d[:, None] * stride_kk
         + offs_n[None, :] * stride_kn
@@ -577,7 +625,7 @@ def _attn_fwd(
     if HAS_PE:
         k_pe_offs = (
             off_z * stride_kz
-            + off_k_head * stride_kh
+            + kh_off
             + cu_seqlens_k_start * stride_kn
             + offs_pe[:, None] * stride_kk
             + offs_n[None, :] * stride_kn
@@ -588,7 +636,7 @@ def _attn_fwd(
 
     v_offs = (
         off_z * stride_vz
-        + off_k_head * stride_vh
+        + vh_off
         + cu_seqlens_k_start * stride_vn
         + offs_n[:, None] * stride_vn
         + offs_d[None, :] * stride_vk
@@ -675,6 +723,14 @@ def _attn_fwd(
     # Here we compute how many full and masked blocks we have.
     padded_block_k = n_extra_tokens != 0
     is_modulo_mn = not padded_block_k and (seqlen_q % BLOCK_M == 0)
+    skipped_blocks = 0
+    if SLIDING_WINDOW > 0:
+        # Skip K blocks that are fully left of the earliest key position
+        # reachable by this Q block. The first retained block can still be
+        # partially outside the window, so we keep the per-element mask below.
+        window_start_n = start_m * BLOCK_M + seqlen_k - seqlen_q - SLIDING_WINDOW
+        skipped_blocks = tl.maximum(window_start_n, 0) // BLOCK_N
+        skipped_blocks = tl.minimum(skipped_blocks, n_blocks)
     if IS_CAUSAL:
         # There are always at least BLOCK_M // BLOCK_N masked blocks.
         # Additionally there might be one more due to dissimilar seqlens.
@@ -684,14 +740,25 @@ def _attn_fwd(
         masked_blocks = padded_block_k
     # if IS_CAUSAL, not is_modulo_mn does not always result in an additional block.
     # In this case we might exceed n_blocks so pick the min.
-    masked_blocks = min(masked_blocks, n_blocks)
-    n_full_blocks = n_blocks - masked_blocks
-    block_min = 0
+    visible_blocks = n_blocks - skipped_blocks
+    masked_blocks = min(masked_blocks, visible_blocks)
+    n_full_blocks = visible_blocks - masked_blocks
+    block_min = skipped_blocks * BLOCK_N
     block_max = n_blocks * BLOCK_N
+    if skipped_blocks > 0:
+        k_ptrs += skipped_blocks * BLOCK_N * stride_kn
+        if HAS_PE:
+            k_pe_ptrs += skipped_blocks * BLOCK_N * stride_kn
+        v_ptrs += skipped_blocks * BLOCK_N * stride_vn
+        if RETURN_SCORES:
+            s_dmask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
+        if ENABLE_DROPOUT:
+            dropout_mask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
+            philox_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
     # Compute for full blocks. Here we set causal to false regardless of its actual
     # value because there is no masking. Similarly we do not need padding.
     if n_full_blocks > 0:
-        block_max = (n_blocks - masked_blocks) * BLOCK_N
+        block_max = block_min + n_full_blocks * BLOCK_N
         acc, l_i, m_i = _attn_fwd_inner(
             acc,
             l_i,
@@ -738,6 +805,7 @@ def _attn_fwd(
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             ENABLE_PIPELINING=True,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -802,6 +870,7 @@ def _attn_fwd(
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             ENABLE_PIPELINING=False,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -817,15 +886,14 @@ def _attn_fwd(
     end_m_idx = (start_m + 1) * BLOCK_M
     start_m_idx = start_m * BLOCK_M
     causal_start_idx = seqlen_q - seqlen_k
-    if IS_CAUSAL:
-        if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
-            out_mask_boundary = tl.full(
-                (BLOCK_DMODEL_POW2,), causal_start_idx, dtype=tl.int32
-            )
-            mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
-            out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
-            z = 0.0
-            acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
+    if IS_CAUSAL and causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
+        out_mask_boundary = tl.full(
+            (BLOCK_DMODEL_POW2,), causal_start_idx, dtype=tl.int32
+        )
+        mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
+        out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
+        z = 0.0
+        acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
 
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     overflow_size = end_m_idx - seqlen_q
@@ -882,15 +950,11 @@ def _get_config(
     enable_dropout: bool,
     dtype: torch.dtype,
     has_pe: bool = False,
+    head_dim_v: int | None = None,
 ):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict["default"] = config
-    fwd_cfg = _get_config._config_dict["default"]["fwd"]
+    dev = arch_info.get_arch()
+    config = load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json")
+    fwd_cfg = config["fwd"]
     has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
     # TODO: pe + dropout is not tuned
     if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
@@ -899,5 +963,11 @@ def _get_config(
         return fwd_cfg["pe"]
     elif enable_dropout or dtype == torch.float32:
         return fwd_cfg["dropout_or_fp32"]
+    elif head_dim_v is not None and 16 < head_dim_v <= 64 and "small_head" in fwd_cfg:
+        # Mid-small V head dims (16 < d <= 64) hit a num_stages=1 software-pipelining
+        # pathology on this backend (e.g. ~3x slower at d64). Using num_stages=3
+        # recovers performance and is numerically verified for these dims, but
+        # regresses d128 and miscompiles d<=16, so only 16 < d <= 64 uses this path.
+        return fwd_cfg["small_head"]
     else:
         return fwd_cfg["default"]

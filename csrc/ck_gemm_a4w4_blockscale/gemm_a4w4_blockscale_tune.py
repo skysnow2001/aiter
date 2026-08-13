@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -29,15 +30,12 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
         return True
     else:
         percent = (a[mask]).numel() / a.numel()
-        if percent > 0.01:
-            return False
-        else:
-            return True
+        return not percent > 0.01
 
 
 def run_torch(x, w, x_scales, w_scales, dtype):
-    m, k = x.shape
-    n, k = w.shape
+    m, _k = x.shape
+    n, _k = w.shape
     # First convert the x and w inputs to f32.
     x_f32 = fp4_utils.mxfp4_to_f32(x)
     w_f32 = fp4_utils.mxfp4_to_f32(w)
@@ -60,8 +58,8 @@ def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
 
 
 def run_gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK):
-    m, k = x.shape
-    n, k = weight.shape
+    m, _k = x.shape
+    _n, _k = weight.shape
     res = aiter.gemm_a4w4_blockscale_tune(
         x, weight, x_scale, w_scale, out, kernel_id, splitK
     )
@@ -80,7 +78,7 @@ def run_gemm_a4w4_blockscale_asm(
     bpreshuffle=True,
     splitK=None,
 ):
-    m, k = x.shape
+    m, _k = x.shape
     # if splitK is not None and splitK > 0:
     #    out_reset = torch.zeros(
     #        out.shape[0], out.shape[1], dtype=dtype, device=torch.cuda.current_device()
@@ -103,8 +101,8 @@ def run_gemm_a4w4_blockscale_asm(
 def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
     torch.manual_seed(seed)
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-    x = torch.randn((m, k), dtype=dtype, device=device)  #
-    w = torch.randn((n, k), dtype=dtype, device=device)  #
+    x = torch.randn((m, k), dtype=dtype, device=device)
+    w = torch.randn((n, k), dtype=dtype, device=device)
     _, x_scales = quant_func(x, shuffle=False)
     _, w_scales = quant_func(w, shuffle=False)
     x, x_scales_shuffle = quant_func(x, shuffle=True)
@@ -114,28 +112,85 @@ def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
     bias_f32 = None
-    return (
-        x,
-        w,
-        x_scales,
-        w_scales,
-        w_shuffle,
-        x_scales_shuffle,
-        w_scales_shuffle,
-        out_ck,
-        bias_f32,
-    )
+    return {
+        "x": x,
+        "w": w,
+        "x_scales": x_scales,
+        "w_scales": w_scales,
+        "w_shuffle": w_shuffle,
+        "x_scales_shuffle": x_scales_shuffle,
+        "w_scales_shuffle": w_scales_shuffle,
+        "out_ck": out_ck,
+        "bias_f32": bias_f32,
+    }
 
 
 class GemmA4W4BlockScaleTuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A4W4}",
         "untune_file": "aiter/configs/a4w4_blockscale_untuned_gemm.csv",
+        "config_env_name": "AITER_CONFIG_GEMM_A4W4",
     }
+
+    def _clear_op_caches(self):
+        from aiter.ops.gemm_op_a4w4 import get_GEMM_config
+
+        get_GEMM_config.cache_clear()
+        if hasattr(get_GEMM_config, "gemm_dict"):
+            del get_GEMM_config.gemm_dict
 
     def _setup_specific_arguments(self):
         pass
+
+    def run_config(self, args):
+        from aiter.ops.gemm_op_a4w4 import gemm_a4w4
+        from aiter.test_common import checkAllclose, run_perftest
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            row = untunedf.iloc[i]
+            M = int(row["M"])
+            N = int(row["N"])
+            K = int(row["K"])
+            shape_str = f"({M}, {N}, {K})"
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
+            try:
+                gd = generate_data(M, N, K, 0)
+                x, w = gd["x"], gd["w"]
+                x_scales, w_scales = gd["x_scales"], gd["w_scales"]
+                w_shuffle = gd["w_shuffle"]
+                x_scales_shuffle = gd["x_scales_shuffle"]
+                w_scales_shuffle = gd["w_scales_shuffle"]
+                out, us = run_perftest(
+                    gemm_a4w4,
+                    x,
+                    w_shuffle,
+                    x_scales_shuffle,
+                    w_scales_shuffle,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = run_torch(x, w, x_scales, w_scales, dtypes.bf16)
+                err_ratio = checkAllclose(
+                    out[:M].to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
+                )
+                status = (
+                    "ok"
+                    if err_ratio <= allowed_err_ratio
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
+                )
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as e:  # noqa: BLE001
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
+                )
+            finally:
+                torch.cuda.empty_cache()
+        return results
 
     def calculate(self, results, bpes=(1 / 2, 1 / 2, 2)):
         return super().calculate(results, bpes=bpes)
@@ -158,7 +213,8 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         return kernel_dict
 
     def getKernelName(self, kernelId):
-        if kernelId < 0 or kernelId > len(kernels_list):
+        # kernels_list is a dict keyed by kernel index; do not use len() bounds only.
+        if kernelId is None or kernelId < 0 or kernelId not in kernels_list:
             return None
         return kernels_list[kernelId].name
 
@@ -168,37 +224,47 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         tunedf,
         args,
     ):
-        issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
-        shape_grouped = False
+        shape_grouped = args.shape_grouped
         errRatio = args.errRatio
-        from aiter.jit.utils.chip_info import get_gfx
+        from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
         if get_gfx() not in ["gfx950"]:
             print(f"tuning is not supported in this chip {get_gfx()}")
             return []
-        gpu = torch.cuda.current_device()
-        device_properties = torch.cuda.get_device_properties(gpu)
-        cu_num = device_properties.multi_processor_count
+        gfx = self.get_gfx()
+        cu_num = self.get_cu_num()
         task = []
         tasks_in_data = []
 
         ck_kernels_num = len(kernels_list)
-        gemm_a4w4_data_idx = [0, 4, 5, 6, 7]  # index in generated data
-        gemm_asm_data_idx = [0, 4, 5, 6, 7, 8]
-        torch_data_idx = [0, 1, 2, 3]
-        seed = 1000
-        for i in range(len(untunedf)):
-            M = untunedf.loc[i, "M"]
-            N = untunedf.loc[i, "N"]
-            K = untunedf.loc[i, "K"]
+        gemm_ck_keys = [
+            "x",
+            "w_shuffle",
+            "x_scales_shuffle",
+            "w_scales_shuffle",
+            "out_ck",
+        ]
+        gemm_asm_keys = [
+            "x",
+            "w_shuffle",
+            "x_scales_shuffle",
+            "w_scales_shuffle",
+            "out_ck",
+            "bias_f32",
+        ]
+        ref_keys = ["x", "w", "x_scales", "w_scales"]
+        seed = 0
+        for shape_idx in range(len(untunedf)):
+            row = untunedf.iloc[shape_idx]
+            # Native int keys so post_process grouping matches single-shape runs (no np.int64 vs int split).
+            M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
 
             total_kernel_nums = 0
-            seed = seed + 1
 
-            for i in range(ck_kernels_num):
-                kernel = kernels_list[i]
+            for kernel_idx in range(ck_kernels_num):
+                kernel = kernels_list[kernel_idx]
                 maxsplitK = (
                     aiter.compute_gemm_SplitK(
                         M,
@@ -212,7 +278,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     else 0
                 )
                 for splitK in range(maxsplitK + 1):
-                    info = ((cu_num, M, N, K), i, splitK, "")
+                    info = ((gfx, cu_num, M, N, K), kernel_idx, splitK, "")
                     task.append(
                         (
                             info,
@@ -220,8 +286,8 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             (M, N, K, seed),
                             run_gemm_a4w4_blockscale,
                             (
-                                gemm_a4w4_data_idx,
-                                i,
+                                gemm_ck_keys,
+                                kernel_idx,
                                 splitK,
                             ),
                             {
@@ -230,13 +296,16 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             },
                             run_torch,
                             (
-                                torch_data_idx,
+                                ref_keys,
                                 dtypes.bf16,
                             ),
                             {},
                             None,
                             1e-2,
                             0.01,
+                            None,
+                            None,
+                            ("out_ck",),
                         )
                     )
                     total_kernel_nums = total_kernel_nums + 1
@@ -244,7 +313,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             asm_kernels_id = ck_kernels_num + 1
             asm_kernel_list_csv = f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
             asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
-            asm_tiles = [key for key in asm_kernels.keys()]
+            asm_tiles = [key for key in asm_kernels]
             for key in asm_tiles:
                 tile_m, tile_n, splitk = key
                 maxsplitK = (
@@ -260,7 +329,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     maxsplitK = 0
                 for splitK in range(maxsplitK + 1):
                     kernel_name = kernelName[0]
-                    info = ((cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
+                    info = ((gfx, cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
                     task.append(
                         (
                             info,
@@ -268,7 +337,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             (M, N, K, seed),
                             run_gemm_a4w4_blockscale_asm,
                             (
-                                gemm_asm_data_idx,
+                                gemm_asm_keys,
                                 kernel_name,
                                 dtypes.bf16,
                                 True,
@@ -280,13 +349,16 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             },
                             run_torch,
                             (
-                                torch_data_idx,
+                                ref_keys,
                                 dtypes.bf16,
                             ),
                             {},
                             None,
                             1e-2,
                             0.01,
+                            None,
+                            None,
+                            ("out_ck",),
                         )
                     )
                     asm_kernels_id = asm_kernels_id + 1

@@ -2,33 +2,45 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
-from typing import Optional, Tuple
+
 import torch
-import aiter
 import triton
+
+import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
-    sage_fwd,
     map_dims,
+    sage_fwd,
 )
-
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant
-
 from aiter.ops.triton.utils._triton import arch_info
 
 
-def get_sage_fwd_configs():
+def get_sage_fwd_configs(
+    block_m: int | None = None,
+    block_n: int | None = None,
+    *,
+    a3_tuned: bool = False,
+):
+    """Return Triton launch config for fav3_sage ``sage_fwd``.
+
+    Default behaviour is unchanged from upstream aiter (gfx942: num_warps=8, etc.).
+
+    Set ``a3_tuned=True`` to opt into MI308/gfx942 perf tuning for 128/64 tiles
+    (num_warps=4, waves_per_eu=2). Numerics match the default launch params;
+    use this when long sequences (e.g. Qwen edit ~8400 tokens) are register-bound.
+    """
     arch = arch_info.get_arch()
     if arch == "gfx950":
-        return {
+        base = {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "waves_per_eu": 2,
             "PRE_LOAD_V": False,
-            "num_stages": 4,
+            "num_stages": 3,
             "num_warps": 8,
         }
     elif arch == "gfx942":
-        return {
+        base = {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "waves_per_eu": 2,
@@ -37,8 +49,7 @@ def get_sage_fwd_configs():
             "num_warps": 8,
         }
     else:
-        # return tuned config for MI300X by default
-        return {
+        base = {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "waves_per_eu": 2,
@@ -46,6 +57,16 @@ def get_sage_fwd_configs():
             "num_stages": 2,
             "num_warps": 8,
         }
+    if block_m is not None:
+        base["BLOCK_M"] = block_m
+    if block_n is not None:
+        base["BLOCK_N"] = block_n
+
+    # Optional MI308/gfx942 perf preset; off by default so callers keep upstream behaviour.
+    if a3_tuned:
+        base["num_warps"] = 4
+        base["waves_per_eu"] = 2
+    return base
 
 
 class _FAv3SageWrapperFunc(torch.autograd.Function):
@@ -68,14 +89,20 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         v: torch.Tensor,
         softmax_scale: float | None,
         causal: bool,
-        window_size: Tuple[int, int],
+        window_size: tuple[int, int],
         attention_chunk: int,
         softcap: float,
         deterministic: bool,
         sm_margin: int,
         return_lse: bool = True,
         layout: str = "bshd",
-        config: Optional[dict] = None,
+        config: dict | None = None,
+        block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        smooth_k: bool = True,
+        q_smooth: bool = False,
+        hadamard_rotation: bool = False,
+        R: torch.Tensor | None = None,
+        BLOCK_R: int | None = None,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -86,6 +113,21 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             config = get_sage_fwd_configs()
 
         BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
+        num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
+        num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
+
+        if block_lut is not None:
+            kv_block_indices, lut_start, lut_count = block_lut
+            use_block_sparse = True
+            if causal or window_size != (-1, -1):
+                raise NotImplementedError(
+                    "The Triton block-sparse attention path selected by block_lut "
+                    "does not support causal or sliding-window masking; "
+                    "require causal=False and window_size=(-1, -1)."
+                )
+        else:
+            kv_block_indices = lut_start = lut_count = None
+            use_block_sparse = False
 
         # 2. Validation: Early Exit for unsupported features
         if attention_chunk not in (0, 1):
@@ -106,7 +148,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         fp8_dtype = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_dtype).max
 
-        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
+        sq_result = sage_quant(
             q,
             k,
             v,
@@ -116,7 +158,22 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             BLKQ=BLKQ,
             BLKK=BLKK,
             layout=layout,
+            smooth_k=smooth_k,
+            q_smoothing=q_smooth,
+            return_lse=return_lse,
+            hadamard_rotation=hadamard_rotation,
+            R=R,
+            BLOCK_R=BLOCK_R,
         )
+        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sq_result[:6]
+        rest = sq_result[6:]
+        delta_s = None
+        sage_lse_delta = None
+        if q_smooth:
+            delta_s = rest[0]
+            rest = rest[1:]
+        if return_lse:
+            sage_lse_delta = rest[0] if rest else None
 
         # 4. Verify Descale Shapes (Grouped scaling for GQA/MQA)
         num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
@@ -140,6 +197,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             q_descale,
             k_descale,
             v_descale,
+            delta_s,
             softmax_scale,
             causal,
             window_size,
@@ -149,21 +207,20 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             return_lse,
             layout,
             config,
+            kv_block_indices=kv_block_indices,
+            lut_start=lut_start,
+            lut_count=lut_count,
+            use_block_sparse=use_block_sparse,
         )
 
-        # 6. Context Saving for Backward
         if return_lse:
-            ctx.save_for_backward(
-                q_int8, k_int8, v_fp8, out, softmax_lse, q_descale, k_descale
-            )
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.softcap = softcap
-            ctx.deterministic = deterministic
-            ctx.sm_margin = sm_margin
-            ctx.input_dtype = q.dtype
-            ctx.layout = layout
+            # Recover the un-smoothed LSE. The kernel computed the LSE
+            # against (K - k_mean); adding delta = sm_scale * Q . k_mean^T
+            # shifts it back so it is consistent with a kernel call on the
+            # un-smoothed K (required for correct ring-attention merging).
+            if sage_lse_delta is not None:
+                softmax_lse = softmax_lse + sage_lse_delta.to(softmax_lse.dtype)
+            return out, softmax_lse
 
         return out
 
@@ -183,6 +240,12 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # return_lse
             None,  # layout
             None,  # config
+            None,  # block_lut
+            None,  # smooth_k
+            None,  # q_smooth
+            None,  # hadamard_rotation
+            None,  # R
+            None,  # BLOCK_R
         )
 
 
@@ -190,16 +253,22 @@ def fav3_sage_wrapper_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
+    window_size: tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
-    inference_mode: bool = True,
+    return_lse: bool = False,
     layout: str = "bshd",
-    config: Optional[dict] = None,
+    config: dict | None = None,
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    smooth_k: bool = True,
+    q_smooth: bool = False,
+    hadamard_rotation: bool = False,
+    R: torch.Tensor | None = None,
+    BLOCK_R: int | None = None,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -216,21 +285,25 @@ def fav3_sage_wrapper_func(
         q: Query tensor [batch, seqlen, num_q_heads, head_dim] (BF16/FP32)
         k: Key tensor [batch, seqlen, num_kv_heads, head_dim] (BF16/FP32)
         v: Value tensor [batch, seqlen, num_kv_heads, head_dim] (BF16/FP32)
-        k_mean: Mean of k to conduct k-smoothing
         softmax_scale: Scaling factor for softmax (default: 1/sqrt(head_dim))
         causal: Whether to apply causal masking
-        qv: Extra query-value tensor (not yet supported)
         window_size: Sliding window attention size (left, right)
         attention_chunk: Chunking parameter (0 or 1 only)
         softcap: Softcapping value (not yet supported)
-        num_splits: Number of splits for parallel processing (not yet supported)
-        pack_gqa: GQA packing flag (not yet supported)
         deterministic: Whether to use deterministic backward (not yet supported)
         sm_margin: SM margin parameter (not yet supported)
-        inference_mode: do not return softmax_lse
+        return_lse: return softmax_lse if True, otherwise return None
         layout: bshd or bhsd layout for the inputs
         config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
                 waves_per_eu, PRE_LOAD_V, num_stages, num_warps
+        block_lut: Optional ragged LUT for block-sparse attention,
+                (kv_block_indices, lut_start, lut_count) from block_attn_mask_to_ragged_lut.
+                When None, dense attention is used.
+        smooth_k: Whether to apply k-smoothing to the K tensor (default: True)
+        q_smooth: Apply per-block Q centering with delta_s bias correction (default: False)
+        hadamard_rotation: Apply normalized Hadamard rotation to Q/K before INT8 quant
+        R: Optional pre-built Hadamard matrix (BLOCK_R x BLOCK_R)
+        BLOCK_R: Hadamard tile size when hadamard_rotation=True and R is None
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -239,7 +312,7 @@ def fav3_sage_wrapper_func(
         - Supports GQA/MQA (num_q_heads != num_kv_heads)
         - Automatically handles grouped quantization for GQA/MQA queries
         - backward is not yet supported
-        - qv, softcap, num_splits, pack_gqa, and sm_margin are not yet supported in FP8 mode
+        - softcap is not yet supported in FP8 mode
     """
 
     # Check that inputs are high precision
@@ -262,8 +335,6 @@ def fav3_sage_wrapper_func(
             "sm_margin != 0 not supported in Sage Attention v1 API"
         )
 
-    return_lse = not inference_mode
-
     return _FAv3SageWrapperFunc.apply(
         q,
         k,
@@ -278,6 +349,12 @@ def fav3_sage_wrapper_func(
         return_lse,
         layout,
         config,
+        block_lut,
+        smooth_k,
+        q_smooth,
+        hadamard_rotation,
+        R,
+        BLOCK_R,
     )
 
 
@@ -288,15 +365,20 @@ def fav3_sage_func(
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
-    softmax_scale: Optional[float] = None,
+    bias: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
+    window_size: tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
     sm_margin: int = 0,
     return_lse: bool = False,
     layout: str = "bshd",
-    config: Optional[dict] = None,
+    config: dict | None = None,
+    kv_block_indices: torch.Tensor | None = None,
+    lut_start: torch.Tensor | None = None,
+    lut_count: torch.Tensor | None = None,
+    use_block_sparse: bool = False,
 ):
     """
     SageAttention v1.
@@ -305,21 +387,23 @@ def fav3_sage_func(
         q: Query tensor [batch, seqlen, num_q_heads, head_dim] (int8)
         k: Key tensor [batch, seqlen, num_kv_heads, head_dim] (int8)
         v: Value tensor [batch, seqlen, num_kv_heads, head_dim] (BF16/FP16)
-        k_mean: Mean of k to conduct k-smoothing
+        q_descale: Descale factors for Q (float32)
+        k_descale: Descale factors for K (float32)
+        v_descale: Descale factors for V (float32)
         softmax_scale: Scaling factor for softmax (default: 1/sqrt(head_dim))
         causal: Whether to apply causal masking
-        qv: Extra query-value tensor (not yet supported)
         window_size: Sliding window attention size (left, right)
         attention_chunk: Chunking parameter (0 or 1 only)
         softcap: Softcapping value (not yet supported)
-        num_splits: Number of splits for parallel processing (not yet supported)
-        pack_gqa: GQA packing flag (not yet supported)
-        deterministic: Whether to use deterministic backward (not yet supported)
         sm_margin: SM margin parameter (not yet supported)
-        inference_model: do not return softmax_lse
+        return_lse: return softmax_lse if True, otherwise return None
         layout: bshd or bhsd layout for the inputs
         config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
                 waves_per_eu, PRE_LOAD_V, num_stages, num_warps
+        kv_block_indices: Optional ragged LUT for block-sparse attention.
+        lut_start: Optional start index for the ragged LUT
+        lut_count: Optional count of the ragged LUT
+        use_block_sparse: Whether to use block-sparse attention
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -392,12 +476,36 @@ def fav3_sage_func(
     stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
     stride_vsz, stride_vsh, _ = v_descale.stride()
 
+    if bias is not None:
+        USE_BIAS = True
+        stride_bz, stride_bh, stride_bm, stride_bn = bias.stride()
+    else:
+        USE_BIAS = False
+        stride_bz, stride_bh, stride_bm, stride_bn = 0, 0, 0, 0
+
     # --- 6. Padding & Metadata ---
     padded_d_model_qk = max(16, 1 << (head_size_qk - 1).bit_length())
     padded_d_model_v = max(16, 1 << (head_size_v - 1).bit_length())
 
     window_size_left, window_size_right = int(window_size[0]), int(window_size[1])
     use_sliding_window = window_size_left != -1 or window_size_right != -1
+
+    if use_block_sparse:
+        if kv_block_indices is None or lut_start is None or lut_count is None:
+            raise ValueError(
+                "kv_block_indices, lut_start, and lut_count must be provided "
+                "when use_block_sparse=True"
+            )
+        if causal:
+            raise NotImplementedError(
+                "The Triton block-sparse attention path selected by block_lut "
+                "does not support causal masking."
+                "require causal=False."
+            )
+    else:
+        kv_block_indices = torch.zeros(1, dtype=torch.int32, device=q.device)
+        lut_start = torch.zeros(1, dtype=torch.int32, device=q.device)
+        lut_count = torch.zeros(1, dtype=torch.int32, device=q.device)
 
     # --- 7. Kernel Launch ---
     def grid(META):
@@ -407,7 +515,7 @@ def fav3_sage_func(
         q,
         k,
         v,
-        None,
+        bias,
         q_descale,
         k_descale,
         v_descale,
@@ -439,10 +547,10 @@ def fav3_sage_func(
         stride_oh,
         stride_om,
         stride_od,
-        0,
-        0,
-        0,
-        0,  # stride_bz, stride_bh, stride_bm, stride_bn
+        stride_bz,
+        stride_bh,
+        stride_bm,
+        stride_bn,
         0,
         0,  # stride_az, stride_ah
         0,
@@ -456,6 +564,10 @@ def fav3_sage_func(
         None,
         None,
         None,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+        num_q_blocks,
         dropout_p=0.0,
         philox_seed=None,
         philox_offset_base=None,
@@ -473,12 +585,13 @@ def fav3_sage_func(
         IS_VARLEN=False,
         BLOCK_DMODEL_QK=padded_d_model_qk,
         BLOCK_DMODEL_V=padded_d_model_v,
-        USE_BIAS=False,
+        USE_BIAS=USE_BIAS,
         USE_ALIBI=False,
         ENABLE_DROPOUT=False,
         USE_EXP2=True,
         RETURN_SCORES=False,
         USE_SEQUSED=False,
+        USE_BLOCK_SPARSE=use_block_sparse,
         **config,
     )
 

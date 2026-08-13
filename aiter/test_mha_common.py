@@ -2,11 +2,14 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
-from .bert_padding import pad_input, unpad_input
-from einops import rearrange, repeat
+
 import torch
 import torch.nn.functional as F
+from einops import rearrange, repeat
+
 from aiter import dtypes
+
+from .bert_padding import pad_input, unpad_input
 
 
 def ck_randval_to_dropout_mask(randval, p):
@@ -125,7 +128,7 @@ def attn_bias_from_alibi_slopes(
     causal=False,
     key_leftpad=None,
 ):
-    batch, nheads = slopes.shape
+    _batch, _nheads = slopes.shape
     device = slopes.device
     slopes = rearrange(slopes, "b h -> b h 1 1")
     if causal:
@@ -194,7 +197,7 @@ def generate_qkv(
         input_layout: "BSHD", "BHSD", "SBHD"
     """
     assert not (kvpacked and qkvpacked)
-    batch_size, seqlen_q, nheads, d = q.shape
+    batch_size, seqlen_q, _nheads, d = q.shape
     _, seqlen_k, nheads_k, _ = k.shape
     _, _, _, d_v = v.shape
     assert k.shape == (batch_size, seqlen_k, nheads_k, d)
@@ -369,14 +372,143 @@ def construct_local_mask(
         if query_padding_mask is None
         else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
     )
-    if window_size[0] < 0:
+    if window_size[0] < 0 and window_size[1] < 0:
+        # both edges unbounded: nothing is masked out
+        return (row_idx < 0) | (col_idx < 0)
+    elif window_size[0] < 0:
+        # unbounded left, finite right
         return col_idx > row_idx + sk - sq + window_size[1]
+    elif window_size[1] < 0:
+        # unbounded right, finite left (mirror of the infinite-left branch)
+        return col_idx < row_idx + sk - sq - window_size[0]
     else:
         sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
         return torch.logical_or(
             col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
             col_idx < row_idx + sk - sq - window_size[0],
         )
+
+
+def block_attn_mask_to_token_mask(
+    block_attn_mask,
+    seqlen_q,
+    seqlen_k,
+    BLOCK_M,
+    BLOCK_N,
+    device,
+):
+    """
+    Build a token-level attention mask from a block-level mask.
+
+    block_attn_mask: 3D (batch, num_q_blocks, num_kv_blocks) or
+        4D (batch, num_heads, num_q_blocks, num_kv_blocks) boolean.
+        True = may attend, False = must not attend.
+    Returns:
+        3D: (batch_size, seqlen_q, seqlen_k) boolean, True = may attend.
+        4D: (batch_size, num_heads, seqlen_q, seqlen_k) boolean, True = may attend.
+    """
+    nd = block_attn_mask.dim()
+    assert nd in (3, 4), "block_attn_mask must be 3D or 4D"
+    q_block_idx = (
+        torch.arange(seqlen_q, device=device)
+        .div(BLOCK_M, rounding_mode="floor")
+        .clamp(max=block_attn_mask.shape[nd - 2] - 1)
+    )
+    k_block_idx = (
+        torch.arange(seqlen_k, device=device)
+        .div(BLOCK_N, rounding_mode="floor")
+        .clamp(max=block_attn_mask.shape[nd - 1] - 1)
+    )
+    if nd == 3:
+        attn_mask = block_attn_mask[:, q_block_idx, :][
+            :, :, k_block_idx
+        ]  # (B, seqlen_q, seqlen_k)
+        return attn_mask
+    # 4D: (B, H, num_q_blocks, num_kv_blocks)
+    attn_mask = block_attn_mask[:, :, q_block_idx, :][
+        :, :, :, k_block_idx
+    ]  # (B, H, seqlen_q, seqlen_k)
+    return attn_mask
+
+
+def attention_ref_block_sparse(
+    q,
+    k,
+    v,
+    block_attn_mask,
+    BLOCK_M,
+    BLOCK_N,
+    query_padding_mask=None,
+    key_padding_mask=None,
+    attn_bias=None,
+    dropout_p=0.0,
+    dropout_mask=None,
+    softcap=0.0,
+    upcast=True,
+):
+    """
+    Reference attention with block-wise sparsity: only (q_block, kv_block) pairs
+    with block_attn_mask[b, qb, kb] == True are allowed to attend.
+
+    q, k, v: same as attention_ref (batch, seqlen_q, nheads, head_dim) in bshd.
+    block_attn_mask: 3D (batch, num_q_blocks, num_kv_blocks) or
+        4D (batch, num_heads, num_q_blocks, num_kv_blocks) boolean.
+    Returns: (output, attention_scores, lse) like attention_ref.
+    """
+    assert block_attn_mask.dim() in (3, 4), "block_attn_mask must be 3D or 4D"
+    dtype_og = q.dtype
+    if upcast:
+        q, k, v = q.float(), k.float(), v.float()
+    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+
+    # Check that the number of keys matches the number of values.
+    assert seqlen_k == v.shape[1]
+
+    k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
+    v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
+    d = q.shape[-1]
+    scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
+    # Apply block-sparse mask: token_mask True = disallow -> -inf
+    allow_mask = block_attn_mask_to_token_mask(
+        block_attn_mask, seqlen_q, seqlen_k, BLOCK_M, BLOCK_N, q.device
+    )
+    token_mask = ~allow_mask  # True = disallow
+    if block_attn_mask.dim() == 3:
+        scores.masked_fill_(rearrange(token_mask, "b t s -> b 1 t s"), float("-inf"))
+    else:
+        scores.masked_fill_(token_mask, float("-inf"))
+    if key_padding_mask is not None:
+        scores.masked_fill_(
+            rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf")
+        )
+    if attn_bias is not None:
+        scores = scores + attn_bias
+    lse = torch.logsumexp(scores, dim=-1).to(v.dtype)
+    attention = torch.softmax(scores, dim=-1).to(v.dtype)
+    all_masked = token_mask.all(
+        dim=-1
+    )  # (batch, seqlen_q) or (batch, num_heads, seqlen_q)
+    if block_attn_mask.dim() == 3:
+        attention = attention.masked_fill(rearrange(all_masked, "b t -> b 1 t 1"), 0.0)
+    else:
+        attention = attention.masked_fill_(all_masked.unsqueeze(-1), 0.0)
+    if query_padding_mask is not None:
+        attention = attention.masked_fill(
+            rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0
+        )
+    dropout_scaling = 1.0 / (1 - dropout_p)
+    if dropout_mask is not None:
+        attention_drop = attention.masked_fill(~dropout_mask, 0.0)
+    else:
+        attention_drop = attention
+    output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
+    if query_padding_mask is not None:
+        output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    return (
+        output.to(dtype=dtype_og),
+        attention.to(dtype=dtype_og),
+        lse.to(dtype=dtype_og),
+    )
 
 
 def attention_ref(
@@ -492,3 +624,57 @@ def attention_ref(
         attention.to(dtype=dtype_og),
         lse.to(dtype=dtype_og),
     )
+
+
+def attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
+    """Run attention reference and compute adaptive tolerances.
+
+    Follows the upstream flash attention tolerance pattern
+    (see tests/test_flash_attn.py in Dao-AILab/flash-attention). Runs two
+    PyTorch references (upcast and non-upcast) and uses the gap between them as
+    a baseline for tolerance.
+
+    Returns (out, (dq, dk, dv), fwd_tol, [dq_tol, dk_tol, dv_tol])
+    where each tol is (atol, rtol).
+    """
+    has_dropout = kwargs.get("dropout_p", 0.0) > 0.0
+
+    def _run_ref(upcast, reorder_ops=False):
+        q_ = q.detach().clone().requires_grad_(True)
+        k_ = k.detach().clone().requires_grad_(True)
+        v_ = v.detach().clone().requires_grad_(True)
+        with torch.enable_grad():
+            out, _, _ = attention_ref(
+                q_, k_, v_, upcast=upcast, reorder_ops=reorder_ops, **kwargs
+            )
+        dq, dk, dv = torch.autograd.grad(out, (q_, k_, v_), do)
+        return out, dq, dk, dv
+
+    def _tol(ref_val, pt_val, is_forward=False):
+        baseline = (pt_val - ref_val).abs().max().item()
+        if is_fp8:
+            mult = 4
+            atol_floor = 5e-1 if is_forward else 1.0
+            rtol_floor = 1e-1
+        elif has_dropout:
+            # Dropout scaling (1/(1-p)) amplifies precision errors in the
+            # fused kernel differently than in the reference. The baseline
+            # between two references uses the same mask so it underestimates
+            # the kernel-vs-reference gap.
+            mult = 2
+            atol_floor = 1e-1 if is_forward else 2.0
+            rtol_floor = 1e-1
+        else:
+            mult = 2
+            atol_floor = 1e-2 if is_forward else 1.5e-2
+            rtol_floor = 1e-5
+        atol = max(mult * baseline, atol_floor)
+        return atol, rtol_floor
+
+    out, dq, dk, dv = _run_ref(upcast=True)
+    out_pt, dq_pt, dk_pt, dv_pt = _run_ref(upcast=False, reorder_ops=True)
+
+    fwd_tol = _tol(out, out_pt, is_forward=True)
+    bwd_tols = [_tol(dq, dq_pt), _tol(dk, dk_pt), _tol(dv, dv_pt)]
+
+    return out, (dq, dk, dv), fwd_tol, bwd_tols

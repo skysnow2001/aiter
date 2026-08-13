@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
-import aiter
+from typing import Any, ClassVar
+
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from gemm_a8w8_common import kernels_list
+
+import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8
 from aiter.utility.base_tuner import GemmCommonTuner
-from gemm_a8w8_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
 
 
@@ -19,10 +22,7 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
         return True
     else:
         percent = (a[mask]).numel() / a.numel()
-        if percent > 0.01:
-            return False
-        else:
-            return True
+        return not percent > 0.01
 
 
 def run_torch(
@@ -56,7 +56,17 @@ def get_tuned_gemm_list(tuned_gemm_file):
         tunedf = pd.read_csv(tuned_gemm_file)
     else:
         tunedf = pd.DataFrame(
-            columns=["cu_num", "M", "N", "K", "kernelId", "splitK", "us", "kernelName"]
+            columns=[
+                "gfx",
+                "cu_num",
+                "M",
+                "N",
+                "K",
+                "kernelId",
+                "splitK",
+                "us",
+                "kernelName",
+            ]
         )
     return tunedf
 
@@ -78,7 +88,13 @@ def generate_data(
         weight, w_scale = aiter.pertoken_quant(weight_fp, quant_dtype=q_dtype_w)
 
     out = torch.empty(m, n, dtype=dtype, device=device)
-    return x, weight, x_scale, w_scale, out
+    return {
+        "x": x,
+        "weight": weight,
+        "x_scale": x_scale,
+        "w_scale": w_scale,
+        "out": out,
+    }
 
 
 def gemm_a8w8_ref(x, weight, x_scale, w_scale, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8):
@@ -92,13 +108,14 @@ def run_gemm_a8w8(x, weight, x_scale, w_scale, out, kernelId, splitK):
 
 
 class GemmA8W8Tuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8}",
         "untune_file": "aiter/configs/a8w8_untuned_gemm.csv",
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",
+        "config_env_name": "AITER_CONFIG_GEMM_A8W8",
     }
 
     def getKernelName(self, kernelId):
@@ -106,11 +123,77 @@ class GemmA8W8Tuner(GemmCommonTuner):
             return None
         return kernels_list[kernelId].name
 
+    def _clear_op_caches(self):
+        from aiter.ops import gemm_op_a8w8 as _op
+
+        _op.get_GEMM_config_with_quant_type.cache_clear()
+        _op._GEMM_QUANT_TYPE_CACHE.clear()
+        _op._GEMM_QUANT_TYPE_HAS_GFX.clear()
+
     def _setup_specific_arguments(self):
         pass
 
     def calculate(self, results, bpes=(1, 1, 2)):
         return super().calculate(results, bpes=(1, 1, 2))
+
+    def run_config(self, args):
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8
+        from aiter.test_common import checkAllclose, run_perftest
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            row = untunedf.iloc[i]
+            M = int(row["M"])
+            N = int(row["N"])
+            K = int(row["K"])
+            q_dtype_w = row["q_dtype_w"]
+            shape_str = f"({M}, {N}, {K}, {q_dtype_w})"
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
+            try:
+                gd = generate_data(M, N, K, 0, dtypes.bf16, eval(q_dtype_w))
+                x, weight, x_scale, w_scale, out = (
+                    gd["x"],
+                    gd["weight"],
+                    gd["x_scale"],
+                    gd["w_scale"],
+                    gd["out"],
+                )
+                out, us = run_perftest(
+                    gemm_a8w8,
+                    x,
+                    weight,
+                    x_scale,
+                    w_scale,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = gemm_a8w8_ref(
+                    x,
+                    weight,
+                    x_scale,
+                    w_scale,
+                    dtype=dtypes.bf16,
+                    q_dtype_w=eval(q_dtype_w),
+                )
+                err_ratio = checkAllclose(
+                    out.to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
+                )
+                status = (
+                    "ok"
+                    if err_ratio <= allowed_err_ratio
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
+                )
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as e:  # noqa: BLE001
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
+                )
+            finally:
+                torch.cuda.empty_cache()
+        return results
 
     def tune(
         self,
@@ -118,17 +201,17 @@ class GemmA8W8Tuner(GemmCommonTuner):
         tunedf,
         args,
     ):
-        issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
-        shape_grouped = False
+        shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
+        gfx = self.get_gfx()
 
         task = []
         tasks_data = []
-        gemm_a8w8_data_idx = [0, 1, 2, 3, 4]  # input index in generate_data
-        ref_data_idx = [0, 1, 2, 3]
+        gemm_keys = ["x", "weight", "x_scale", "w_scale", "out"]
+        ref_keys = ["x", "weight", "x_scale", "w_scale"]
         seed = 0
 
         for i in range(len(untunedf)):
@@ -136,11 +219,10 @@ class GemmA8W8Tuner(GemmCommonTuner):
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
             q_dtype_w = untunedf.loc[i, "q_dtype_w"]
-            seed = seed + 1
 
             kernels_num = len(kernels_list)
             total_kernel_nums = 0
-            info_keys = (cu_num, M, N, K, q_dtype_w)
+            info_keys = (gfx, cu_num, M, N, K, q_dtype_w)
 
             for j in range(kernels_num):
                 kernel = kernels_list[j]
@@ -164,17 +246,20 @@ class GemmA8W8Tuner(GemmCommonTuner):
                             generate_data,
                             (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
                             run_gemm_a8w8,
-                            (gemm_a8w8_data_idx, j, splitK),
+                            (gemm_keys, j, splitK),
                             {
                                 "num_warmup": args.warmup,
                                 "num_iters": args.iters,
                             },
                             gemm_a8w8_ref,
-                            (ref_data_idx, dtypes.bf16, eval(q_dtype_w)),
+                            (ref_keys, dtypes.bf16, eval(q_dtype_w)),
                             {},
                             None,
                             1e-2,
                             1e-2,
+                            None,
+                            None,
+                            ("out",),
                         )
                     )
                     total_kernel_nums = total_kernel_nums + 1
@@ -199,7 +284,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
 if __name__ == "__main__":
 
     ## use default key and resultList with q_dtype_w support
-    key = ["cu_num", "M", "N", "K", "q_dtype_w"]
+    key = ["gfx", "cu_num", "M", "N", "K", "q_dtype_w"]
     resultList = [
         "kernelId",
         "splitK",

@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
-import sys
-import os
+# Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
+import os
+import sys
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/../../../aiter/")
-from jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_META_DIR  # noqa: E402
+from jit.core import AITER_CSRC_DIR, AITER_META_DIR, CK_DIR, compile_ops
 
 FWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}"]
 BWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}"]
@@ -38,6 +38,8 @@ def cmdGenFunc_mha_fwd(ck_exclude: bool):
         "md_name": "libmha_fwd",
         "blob_gen_cmd": blob_gen_cmd,
         "flags_extra_cc": [flag_use_v3],
+        "torch_exclude": True,
+        "is_python_module": False,
     }
 
 
@@ -62,6 +64,8 @@ def cmdGenFunc_mha_bwd(ck_exclude: bool):
         "md_name": "libmha_bwd",
         "blob_gen_cmd": blob_gen_cmd,
         "flags_extra_cc": flags_extra_cc,
+        "torch_exclude": True,
+        "is_python_module": False,
     }
 
 

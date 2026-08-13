@@ -29,7 +29,7 @@
 #define OPUS_H_D_EXTERN __host__ __device__
 #else
 #define OPUS_H inline
-#define OPUS_D inline
+#define OPUS_D
 #define OPUS_H_D inline
 #define OPUS_D_EXTERN
 #define OPUS_H_D_EXTERN
@@ -181,12 +181,16 @@ template<typename F, typename... R, std::enable_if_t<(is_constant_v<R> && ...), 
 OPUS_H_D constexpr void static_for(F f, R...) { impl::static_for_impl<make_index_seq<R::value...>>{}(f); }
 
 namespace impl {
-template <typename Seq> struct static_ford_impl {
-    template <typename F, typename... Ids> OPUS_H_D constexpr void operator()(F f, Ids... ids) const {
-        static_for<get<0>(Seq{})>([=](auto I){ static_ford_impl<decltype(seq_pop_front(Seq{}))>{}(f, ids..., I); });
-    }
+// Flat static_ford: single-level static_for, non-recursive compile-time index decomposition via fold expressions
+template <index_t D, index_t... Is, index_t... Ns> constexpr index_t ford_stride(seq<Is...>, seq<Ns...>) { return ((Is > D ? Ns : index_t(1)) * ... * index_t(1)); }
+template <index_t D, index_t... Is, index_t... Ns> constexpr index_t ford_dim(seq<Is...>, seq<Ns...>) { return ((Is == D ? Ns : index_t(1)) * ...); }
+template <index_t I, index_t D, index_t... Ns> constexpr index_t ford_at() { return (I / ford_stride<D>(make_index_seq<sizeof...(Ns)>{}, seq<Ns...>{})) % ford_dim<D>(make_index_seq<sizeof...(Ns)>{}, seq<Ns...>{}); }
+template <typename Seq> struct static_ford_impl;
+template <index_t... Ns> struct static_ford_impl<seq<Ns...>> {
+    template <typename F, index_t I, index_t... Ds> OPUS_H_D static constexpr void call_one(F& f, number<I>, seq<Ds...>) { f(number<ford_at<I, Ds, Ns...>()>{}...); }
+    template <typename F> OPUS_H_D constexpr void operator()(F f) const { static_for<(Ns * ... * 1)>([&](auto I) { call_one(f, I, make_index_seq<sizeof...(Ns)>{}); }); }
 };
-template <> struct static_ford_impl<seq<>> { template <typename F, typename... Ids> OPUS_H_D constexpr void operator()(F f, Ids... ids) const { f(ids...); } };
+template <> struct static_ford_impl<seq<>> { template <typename F> OPUS_H_D constexpr void operator()(F f) const { f(); } };
 }
 
 template<index_t... N, typename F> OPUS_H_D constexpr void static_ford(F f) { impl::static_ford_impl<seq<N...>>{}(f); }
@@ -198,33 +202,120 @@ template<typename T, typename R = void> struct get_value_type { using type = rem
 template<typename T, typename R = void> using get_value_t = typename get_value_type<T, R>::type;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// array, enhanced C like array style
+// sub-byte "packs" (fp4_t/int4_t/uint4_t): ONE logical <8-bit element, cutlass float_e2m1_t style. Full byte standalone/in a C array; opus::array/vector bit-pack it (via is_packs_v) and hand out a proxy reference.
+namespace impl {
+// "pack" trait carrier. `storage` = smallest addressable unit; `num_packs` = logical elements per storage unit (for computing packed byte size).
+template<typename storage_, unsigned int bits_, bool is_signed_ = true>
+struct dpacks {
+    using storage = remove_cvref_t<storage_>;
+    static constexpr unsigned int bits = bits_;
+    static constexpr unsigned int mask = (1 << bits) - 1;
+    static constexpr bool is_signed = is_signed_;
+    static constexpr unsigned int num_packs = sizeof(storage) * 8 / bits;   // logical elements per storage unit
+    storage value;   // holds ONE logical element in the low `bits` bits when standalone
+};
+
+template<typename storage_, unsigned int bits_, unsigned int exp_bits_, unsigned int mantissa_bits_, bool is_signed_ = true>
+struct fpacks : dpacks<storage_, bits_, is_signed_> {
+    static constexpr unsigned int exp_bits = exp_bits_;
+    static constexpr unsigned int mantissa_bits = mantissa_bits_;
+};
+} // namespace impl
+
+template <typename> struct is_packs : false_type {};
+template <typename S, unsigned int B, bool X> struct is_packs<impl::dpacks<S, B, X>> : true_type {};
+template <typename S, unsigned int B, unsigned int E, unsigned int M, bool X> struct is_packs<impl::fpacks<S, B, E, M, X>> : true_type {};
+template <typename T> static constexpr bool is_packs_v = is_packs<remove_cvref_t<T>>::value;
+
+// how many logical elements fit in one storage byte (1 for non-pack scalars)
+template <typename T, typename = void> struct num_packs { static constexpr int value = 1; };
+template <typename T> struct num_packs<T, std::enable_if_t<is_packs_v<T>>> { static constexpr int value = T::num_packs; };
+template <typename T> static constexpr int num_packs_v = num_packs<T>::value;
+
+template <typename T> struct sizeof_bits { static constexpr int value = int(sizeof(T) * 8); };
+template <> struct sizeof_bits<void> { static constexpr int value = 0; };
+template <typename S, unsigned int B, bool X> struct sizeof_bits<impl::dpacks<S, B, X>> { static constexpr int value = impl::dpacks<S, B, X>::bits; };
+template <typename S, unsigned int B, unsigned int E, unsigned int M, bool X> struct sizeof_bits<impl::fpacks<S, B, E, M, X>> { static constexpr int value = impl::fpacks<S, B, E, M, X>::bits; };
+template <class T> static constexpr auto sizeof_bits_v = sizeof_bits<T>::value;
+
+template <typename T, index_t N> static constexpr index_t packed_bytes_v = index_t((index_t(sizeof_bits<T>::value) * N + 7) / 8);
+
+namespace impl {
+template<typename T>
+struct subbyte_reference {
+    using storage = typename T::storage;
+    static constexpr unsigned int bits = T::bits;
+    static constexpr storage vmask = storage((storage(1) << bits) - 1);
+    storage* ptr_;
+    unsigned int idx_;   // logical element index within *ptr_ (0..num_packs-1)
+    OPUS_H_D constexpr subbyte_reference(storage* p, unsigned int i) : ptr_(p), idx_(i) {}
+    OPUS_H_D constexpr subbyte_reference(const subbyte_reference&) = default;
+    OPUS_H_D constexpr T get() const {
+        storage v = storage((storage(*ptr_) >> (idx_ * bits)) & vmask);
+        return __builtin_bit_cast(T, v);
+    }
+    OPUS_H_D constexpr operator T() const { return get(); }
+    OPUS_H_D constexpr const subbyte_reference& operator=(const T& x) const {
+        storage item = storage(__builtin_bit_cast(storage, x) & vmask);
+        storage clr  = storage(~(vmask << (idx_ * bits)));
+        *ptr_ = storage((storage(*ptr_) & clr) | storage(item << (idx_ * bits)));
+        return *this;
+    }
+    OPUS_H_D constexpr const subbyte_reference& operator=(const subbyte_reference& o) const { return *this = o.get(); }
+};
+template<typename T>
+struct const_subbyte_reference {
+    using storage = typename T::storage;
+    static constexpr unsigned int bits = T::bits;
+    static constexpr storage vmask = storage((storage(1) << bits) - 1);
+    const storage* ptr_;
+    unsigned int idx_;
+    OPUS_H_D constexpr const_subbyte_reference(const storage* p, unsigned int i) : ptr_(p), idx_(i) {}
+    OPUS_H_D constexpr const_subbyte_reference(const subbyte_reference<T>& r) : ptr_(r.ptr_), idx_(r.idx_) {}
+    OPUS_H_D constexpr T get() const {
+        storage v = storage((storage(*ptr_) >> (idx_ * bits)) & vmask);
+        return __builtin_bit_cast(T, v);
+    }
+    OPUS_H_D constexpr operator T() const { return get(); }
+};
+} // namespace impl
+
+namespace impl {
+template<typename V, index_t N, bool = is_packs_v<V>> struct array_storage { using type = V; static constexpr index_t count = N; };
+template<typename V, index_t N> struct array_storage<V, N, true> { using type = typename V::storage; static constexpr index_t count = packed_bytes_v<V, N>; };
+}
 template <typename T, index_t N>
 struct array {
     using value_type = remove_cvref_t<T>;
     using type = array<value_type, N>;
-#if 0   // don't define following, just let me be trivially copyable class
+    static constexpr bool is_packed = is_packs_v<value_type>;
+    using storage = typename impl::array_storage<value_type, N>::type;             // value_type, or the pack's byte storage
+    static constexpr index_t nstore = impl::array_storage<value_type, N>::count;   // N, or the packed byte count
+    using reference       = std::conditional_t<is_packed, impl::subbyte_reference<value_type>, value_type&>;
+    using const_reference = std::conditional_t<is_packed, impl::const_subbyte_reference<value_type>, const value_type&>;
+
     OPUS_H_D constexpr array() = default;
-    OPUS_H_D constexpr array(const type& o) { static_for<N>([&](auto i){ content[i.value] = o[i.value]; }); }
-    OPUS_H_D constexpr type& operator=(const type o) { static_for<N>([&](auto i){ content[i.value] = o[i.value]; }); return *this; }
-    template<typename...Z, std::enable_if_t<(std::is_same_v<remove_cvref_t<Z>, value_type> && ...), bool> = true>
-    OPUS_H_D constexpr array(Z&&... zs) : content{zs...}  { /* used for make_array */ }
-#endif
-    OPUS_H_D constexpr value_type& operator[](index_t pos) { return content[pos]; }
-    OPUS_H_D constexpr const value_type& operator[](index_t pos) const { return content[pos]; }
-    template<index_t I> OPUS_H_D constexpr value_type& operator[](number<I>) { return content[I]; }
-    template<index_t I> OPUS_H_D constexpr const value_type& operator[](number<I>) const { return content[I]; }
-    OPUS_H_D constexpr void fill(const T& value) { static_for<N>([&](auto i){ content[i.value] = value; }); }
-    OPUS_H_D constexpr void clear() { fill(static_cast<T>(0)); }
+    template<typename... Z, std::enable_if_t<!is_packs_v<value_type> && sizeof...(Z) == N && (std::is_convertible_v<Z, value_type> && ...), bool> = true>
+    OPUS_H_D constexpr array(Z&&... zs) : content{ static_cast<value_type>(zs)... } {}
+    template<typename... Z, std::enable_if_t<is_packs_v<value_type> && sizeof...(Z) == N && (std::is_convertible_v<Z, value_type> && ...), bool> = true>
+    OPUS_H_D constexpr array(Z... zs) { index_t i = 0; ((void)((*this)[i++] = static_cast<value_type>(zs)), ...); }
+
+    OPUS_H_D constexpr reference       operator[](index_t pos)       { if constexpr (is_packed) return reference(&content[pos / value_type::num_packs], (unsigned)(pos % value_type::num_packs)); else return content[pos]; }
+    OPUS_H_D constexpr const_reference operator[](index_t pos) const { if constexpr (is_packed) return const_reference(&content[pos / value_type::num_packs], (unsigned)(pos % value_type::num_packs)); else return content[pos]; }
+    template<index_t I> OPUS_H_D constexpr reference       operator[](number<I>)       { if constexpr (is_packed) return reference(&content[I / value_type::num_packs], (unsigned)(I % value_type::num_packs)); else return content[I]; }
+    template<index_t I> OPUS_H_D constexpr const_reference operator[](number<I>) const { if constexpr (is_packed) return const_reference(&content[I / value_type::num_packs], (unsigned)(I % value_type::num_packs)); else return content[I]; }
+
+    OPUS_H_D constexpr void fill(const value_type& value) { for (index_t i = 0; i < N; ++i) (*this)[i] = value; }
+    OPUS_H_D constexpr void clear() { if constexpr (is_packed) { for (index_t i = 0; i < nstore; ++i) content[i] = storage(0); } else { fill(static_cast<value_type>(0)); } }
     OPUS_H_D static constexpr bool empty() { return size() == 0; }
     OPUS_H_D static constexpr index_t size() { return N; }
 
-    // we need this "content" member to have a default value, so that the implicitly defined constructor could be constexpr
+    // default member initializer keeps the implicitly-defaulted default ctor constexpr
     // see: https://en.cppreference.com/w/cpp/language/constexpr.html#constexpr_constructor
-    value_type content[N] {};
+    storage content[nstore] {};
 };
 
-template <typename T, index_t N>
+template <typename T, index_t N, std::enable_if_t<!is_packs_v<T>, bool> = true>
 OPUS_H_D constexpr bool operator==(const array<T,N>& x, const array<T,N>& y) { for (index_t i = 0; i < N; ++i) { if (x[i] != y[i]) { return false; } } return true; }
 
 template <typename T, index_t N> OPUS_H_D constexpr void clear(array<T,N>& a) { a.clear(); }
@@ -249,9 +340,10 @@ template<typename D, typename... Types> using array_return_type = opus::array<ty
 }
 template<typename D = void, typename... Types> OPUS_H_D constexpr impl::array_return_type<D, Types...> make_array(Types&&... t) { return {std::forward<Types>(t)...}; }
 
-template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T const& t) { static_assert(I < T::size()); return t[number<I>{}]; }
-template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T&  t)      { static_assert(I < T::size()); return t[number<I>{}]; }
-template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T&& t)      { static_assert(I < T::size()); return t[number<I>{}]; }
+// For packed arrays operator[] yields a proxy; get<> decays it to the value type so make_array/concat_array deduce the element type, not the proxy.
+template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T const& t) { static_assert(I < T::size()); if constexpr (is_packs_v<typename T::value_type>) return typename T::value_type(t[number<I>{}]); else return t[number<I>{}]; }
+template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T&  t)      { static_assert(I < T::size()); if constexpr (is_packs_v<typename T::value_type>) return typename T::value_type(t[number<I>{}]); else return t[number<I>{}]; }
+template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T&& t)      { static_assert(I < T::size()); if constexpr (is_packs_v<typename T::value_type>) return typename T::value_type(t[number<I>{}]); else return t[number<I>{}]; }
 
 namespace impl {
 template <class T0, class T1, index_t... I0, index_t... I1>
@@ -375,12 +467,20 @@ OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2) 
 template <class T0, class T1, class T2, class T3>
 OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3) {
                                             return impl::concat_tuple(t0, t1, t2, t3, make_index_seq<T0::size()>{}, make_index_seq<T1::size()>{}, make_index_seq<T2::size()>{}, make_index_seq<T3::size()>{}); }
-template <class T0, class T1, class T2, class T3, class T4, class... Ts>
-OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4, Ts const&... ts) { return concat_tuple(concat_tuple(t0, t1, t2, t3), concat_tuple(t4, ts...)); }
+namespace impl { template <class T0, class T1, class T2, class T3, class T4, index_t... I0, index_t... I1, index_t... I2, index_t... I3, index_t... I4>
+OPUS_H_D constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4, seq<I0...>, seq<I1...>, seq<I2...>, seq<I3...>, seq<I4...>) { return opus::make_tuple(get<I0>(t0)..., get<I1>(t1)..., get<I2>(t2)..., get<I3>(t3)..., get<I4>(t4)...); } }
+template <class T0, class T1, class T2, class T3, class T4>
+OPUS_H_D constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4) { return impl::concat_tuple(t0, t1, t2, t3, t4, make_index_seq<T0::size()>{}, make_index_seq<T1::size()>{}, make_index_seq<T2::size()>{}, make_index_seq<T3::size()>{}, make_index_seq<T4::size()>{}); }
+template <class T0, class T1, class T2, class T3, class T4, class T5, class... Ts>
+OPUS_H_D constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4, T5 const& t5, Ts const&... ts) { return concat_tuple(concat_tuple(t0, t1, t2, t3, t4), concat_tuple(t5, ts...)); }
 
 template <typename> struct is_tuple : false_type {};
 template <typename... T> struct is_tuple<opus::tuple<T...>> : true_type {};
 template <typename T> static constexpr bool is_tuple_v = is_tuple<remove_cvref_t<T>>::value;
+template <typename T> struct is_static_tuple : is_constant<remove_cvref_t<T>> {};
+template <> struct is_static_tuple<underscore> : true_type {};
+template <typename... T> struct is_static_tuple<opus::tuple<T...>> : bool_constant<(is_static_tuple<T>::value && ...)> {};
+template <typename T> static constexpr bool is_static_tuple_v = is_static_tuple<remove_cvref_t<T>>::value;
 template<typename T> struct get_value_type<T, std::enable_if_t<is_tuple_v<T>>> { using type = tuple_element_t<0, T>; };   // TODO: get the first element type
 
 template<typename T> OPUS_H_D constexpr std::enable_if_t<is_tuple_v<T>, index_t> size(T&&) { return remove_cvref_t<T>::size(); /* tuple size */}
@@ -391,8 +491,22 @@ template <typename T, index_t... Is> OPUS_H_D constexpr auto                    
 template <typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto  explode_tuple(const T& t) { return explode_tuple(t, make_index_seq<size<T>()>{}); }
 template <typename T, index_t... Is> OPUS_H_D constexpr auto                                 explode_tuple(const T& t, seq<Is...>) { return concat_tuple(explode_tuple(get<Is>(t))...); }
 
-template <typename T, index_t... Is> OPUS_H_D constexpr auto flatten_tuple(const T& t, seq<Is...>) { return concat_tuple(explode_tuple(get<Is>(t))...); }
-template <typename T> OPUS_H_D constexpr auto                flatten_tuple(const T& t) { return flatten_tuple(t, make_index_seq<size<T>()>{}); }
+template <typename T, index_t... Is> OPUS_H_D constexpr auto flatten_tuple_general(const T& t, seq<Is...>) { return concat_tuple(explode_tuple(get<Is>(t))...); }
+template <typename T, std::enable_if_t<is_tuple_v<T> && !(is_tuple_v<tuple_element_t<0, remove_cvref_t<T>>>), bool> = true>
+OPUS_H_D constexpr auto flatten_tuple(const T& t) { return t; }  // already flat
+template <typename T, std::enable_if_t<!is_tuple_v<T>, bool> = true>
+OPUS_H_D constexpr auto flatten_tuple(const T& t) { return flatten_tuple_general(t, make_index_seq<size<T>()>{}); }  // non-tuple (e.g. seq)
+namespace impl { // direct flatten for 1-level nested tuples -- bypasses concat_tuple + explode_tuple
+template<typename T, index_t... Gs> constexpr auto group_sizes(seq<Gs...>) { return seq<size<tuple_element_t<Gs, T>>()...>{}; }
+template<typename T, index_t... Gs> constexpr index_t group_total(seq<Gs...>) { return (size<tuple_element_t<Gs, T>>() + ...); }
+template<index_t J, index_t... Gs, index_t... Ns> constexpr index_t flat_group(seq<Gs...>, seq<Ns...>) { index_t acc = 0, r = 0; ((void)(acc += Ns, (acc <= J ? (void)(r = Gs + 1) : (void)0)), ...); return r; }
+template<typename T, index_t G, index_t... Gs> constexpr index_t group_offset(seq<Gs...>) { return ((Gs < G ? size<tuple_element_t<Gs, T>>() : 0) + ...); }
+template<typename T, index_t J, typename GS> OPUS_H_D constexpr auto flatten_at(const T& t) {
+    constexpr auto gs = make_index_seq<size<T>()>{}; constexpr index_t G = flat_group<J>(gs, GS{}); return get<J - group_offset<T, G>(gs)>(get<G>(t)); }
+template<typename T, typename GS, index_t... Js> OPUS_H_D constexpr auto flatten_tuple_impl(const T& t, seq<Js...>) { return opus::make_tuple(flatten_at<T, Js, GS>(t)...); }
+}
+template <typename T, std::enable_if_t<is_tuple_v<T> && (is_tuple_v<tuple_element_t<0, remove_cvref_t<T>>>), bool> = true>
+OPUS_H_D constexpr auto flatten_tuple(const T& t) { using U = remove_cvref_t<T>; constexpr auto gs = make_index_seq<size<U>()>{}; return impl::flatten_tuple_impl<U, decltype(impl::group_sizes<U>(gs))>(t, make_index_seq<impl::group_total<U>(gs)>{}); }
 
 namespace impl {
 template<typename Outer, typename Inner, index_t...Is>
@@ -432,6 +546,9 @@ template<typename R, typename T, std::enable_if_t<is_tuple_v<T>, bool> = true>
 OPUS_H_D constexpr auto reduce_tuple(const T & t) { return  impl::reduce_tuple_impl<R>(t, make_index_seq<size<T>()>{}); }
 template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto reduce_tuple_sum(const T & t) { return reduce_tuple<opus::plus>(t); }
 template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto reduce_tuple_mul(const T & t) { return reduce_tuple<opus::multiplies>(t); }
+// Fast path: fold expression for tuple of number<> types (avoids N-1 intermediate tuple types)
+template<typename... Ns, std::enable_if_t<sizeof...(Ns) != 0 && (is_constant_v<Ns> && ...), bool> = true>
+OPUS_H_D constexpr auto reduce_tuple_mul(const tuple<Ns...>&) { return opus::tuple<number<(Ns::value * ...)>>{}; }
 
 namespace impl {
 template<typename PT, index_t... Js>
@@ -470,6 +587,9 @@ template <std::size_t I, typename... Ts> struct tuple_element<I, const opus::tup
 } // namespace std
 
 namespace opus {
+// fwd-decl mma adaptors -- needed so make_tiled_mma() parses on archs (gfx12) where full defs are gated out.
+struct mfma_adaptor; struct mfma_adaptor_swap_ab; struct wmma_adaptor; struct wmma_adaptor_swap_ab;
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // transforms
 template<typename X, typename Y, index_t... Is> constexpr auto embed(const X& x, const Y& y, seq<Is...>) { return ( ... + (get<Is>(x) * get<Is>(y))); }
@@ -611,11 +731,36 @@ struct layout_cached : public remove_cvref_t<Layout> {
     array<index_t, num_issues> offsets;
 };
 
+// Wraps a layout with a *compile-time* offset N. Keeping N in the type lets smem::tr_load lower it into the `offset:` immediate of ds_read_b64_tr_*,
+// Construct it as `layout/layout_linear/layout_cached + number<N>{}`
+template<typename Layout, index_t N>
+struct layout_shifted : public remove_cvref_t<Layout> {
+    using base = remove_cvref_t<Layout>;
+    OPUS_H_D constexpr layout_shifted(const base& layout) : base(layout) {}
+    template<typename Shape, typename Stride, typename Coord = false_type>
+    OPUS_H_D constexpr layout_shifted(const Shape& shape, const Stride& stride, const Coord& coord = {}) : base(shape, stride, coord) {}
+    template <typename... Cs>
+    OPUS_H_D constexpr auto operator()(Cs&&... cs) const { return base::operator()(std::forward<Cs>(cs)...) + N; }
+
+    OPUS_H_D constexpr layout_shifted& operator+=(index_t offset) { static_cast<base&>(*this) += offset; return *this; }
+    OPUS_H_D constexpr layout_shifted operator+(index_t offset) const { layout_shifted result(*this); static_cast<base&>(result) += offset; return result; }
+};
+
 template<typename T> struct is_layout : false_type {};
 template<typename X, typename Y, typename Z> struct is_layout<layout<X, Y, Z>> : true_type {};
 template<index_t cached_vec, typename Layout> struct is_layout<layout_cached<cached_vec, Layout>> : true_type {};
 template<typename Layout> struct is_layout<layout_linear<Layout>> : true_type {};
+template<typename Layout, index_t N> struct is_layout<layout_shifted<Layout, N>> : true_type {};
 template<typename T> constexpr bool is_layout_v = is_layout<remove_cvref_t<T>>::value;
+
+template<typename Layout> struct layout_shift_traits { using base = Layout; static constexpr index_t value = 0; };
+template<typename Layout, index_t N> struct layout_shift_traits<layout_shifted<Layout, N>> { using base = remove_cvref_t<Layout>; static constexpr index_t value = N; };
+template<typename Layout, index_t N, std::enable_if_t<is_layout_v<remove_cvref_t<Layout>>, bool> = true>
+OPUS_H_D constexpr auto operator+(const Layout& layout, number<N>) {
+    using shift = layout_shift_traits<remove_cvref_t<Layout>>;
+    if constexpr (N == 0) return layout;
+    else                  return layout_shifted<typename shift::base, shift::value + N>(static_cast<const typename shift::base&>(layout));
+}
 
 template <typename Layout>
 OPUS_H_D constexpr auto layout_to_issue_space() {
@@ -643,28 +788,45 @@ OPUS_H_D constexpr auto layout_to_vectorized_issue_space() {
     return issue_space_vec;
 }
 
-// this function is usually not constexpr. pre-compute all the offset under current layout
-template<index_t vec, typename Layout>
-OPUS_H_D constexpr auto layout_to_offsets(const Layout& u) {
-    constexpr auto issue_space_vec = layout_to_vectorized_issue_space<vec, Layout>();
-    constexpr index_t num_issues = get<0>(reduce_tuple_mul(issue_space_vec)).value;
+// Cache issue-space computations for load/store (avoids redundant evaluation across methods)
+template<typename Layout, index_t vec = 1> struct layout_load_traits {
+    static constexpr auto issue_space = layout_to_issue_space<Layout>();
+    static constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{}); static constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+};
+// Runtime flat index -> multi-index tuple (all index_t) -- avoids per-iteration template instantiation
+template<index_t... Is, index_t... Ns> OPUS_H_D constexpr auto flat_to_coords(index_t flat, seq<Is...>, tuple<number<Ns>...>) {
+    constexpr index_t strides[] = {impl::ford_stride<Is>(make_index_seq<sizeof...(Ns)>{}, seq<Ns...>{})...}, dims[] = {Ns...};
+    return opus::make_tuple(static_cast<index_t>((flat / strides[Is]) % dims[Is])...); }
+// Pre-compute offsets via runtime loop -- 1 coord_to_linear instantiation per layout instead of N
+template<index_t vec, typename Layout> OPUS_H_D constexpr auto layout_to_offsets(const Layout& u) {
+    using LT = layout_load_traits<Layout, vec>; constexpr auto issue_space_vec = LT::issue_space_vec;
+    constexpr index_t num_issues = LT::r_elem.value, ndim = size<remove_cvref_t<decltype(issue_space_vec)>>();
     array<index_t, num_issues> offsets;
-
-    constexpr auto u_linear = make_layout<-1>(issue_space_vec);
-    static_ford(issue_space_vec, [&](auto ... ids){ offsets[u_linear(ids...)] = u(ids...); });
-    return offsets;
-}
+    for (index_t i = 0; i < num_issues; i++) offsets[i] = u(flat_to_coords(i, make_index_seq<ndim>{}, issue_space_vec));
+    return offsets; }
+// Compile-time per-issue offsets for layouts with static Shape/Stride
+template<typename Layout, index_t vec>
+inline constexpr auto layout_imm_offsets_v = layout_to_offsets<vec>(Layout{typename Layout::Shape{}, typename Layout::Stride{}, typename Layout::Coord{}});
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // vector, a wrapper for __attribute__((ext_vector_type(*)))
+namespace impl {
+template <typename T, index_t N> struct packed_vec : opus::array<T, N> { using base = opus::array<T, N>; using base::base; };
+template<typename V, index_t N, bool = is_packs_v<V>> struct vector_storage { using type = V __attribute__((ext_vector_type(N))); };
+template<typename V, index_t N> struct vector_storage<V, N, true> { using type = packed_vec<V, N>; };
+}
 template <typename V_, index_t N_> // V_ must be literal type, otherwise clang ext_vector_type will not recognize
 struct vector {
     static constexpr index_t N = N_;
     using value_type           = remove_cvref_t<V_>;
-    using type = value_type __attribute__((ext_vector_type(N))); // this is danguous
+    using type = typename impl::vector_storage<value_type, N_>::type;
 };
 template <typename T, index_t N> using vector_t = typename vector<T, N>::type;
 
 template <typename> struct is_vector : false_type {};
+template <typename T, index_t N> struct is_vector<impl::packed_vec<T, N>>    : true_type {};
+template <typename T, index_t N> struct is_vector<impl::packed_vec<T, N>&>   : true_type {};
+template <typename T, index_t N> struct is_vector<const impl::packed_vec<T, N>&> : true_type {};
+template <typename T, index_t N> struct is_vector<impl::packed_vec<T, N>&&>  : true_type {};
 template <typename T, index_t N> struct is_vector<T __attribute((ext_vector_type(N)))> : true_type {};
 template <typename T, index_t N> struct is_vector<T __attribute((ext_vector_type(N)))&> : true_type {};
 template <typename T, index_t N> struct is_vector<const T __attribute((ext_vector_type(N)))&> : true_type {};
@@ -675,6 +837,7 @@ namespace impl {
 template <typename T>            struct vector_traits_impl { using dtype = remove_cvref_t<T>; static constexpr index_t size() { return 1; } };
 template <typename T, index_t N> struct vector_traits_impl<T __attribute__((ext_vector_type(N)))> { using dtype = T; static constexpr index_t size() { return N; } };
 template <typename T, index_t N> struct vector_traits_impl<array<T, N>> { using dtype = T; static constexpr index_t size() { return N; } };
+template <typename T, index_t N> struct vector_traits_impl<impl::packed_vec<T, N>> { using dtype = T; static constexpr index_t size() { return N; } };
 template <typename... T>         struct vector_traits_impl<tuple<T...>> { using dtype = __type_pack_element<0, T...> /*TODO: use first type*/; static constexpr index_t size() { return sizeof...(T); } };
 }
 template <typename T> struct vector_traits : public impl::vector_traits_impl<remove_cvref_t<T>> {};
@@ -704,7 +867,12 @@ template <index_t I, typename T, std::enable_if_t<is_vector_v<T>, bool> = true> 
 
 namespace impl {
 template <class T0, class T1, index_t... I0, index_t... I1>
-OPUS_H_D constexpr auto concat_vector(T0 const& t0, T1 const& t1, seq<I0...>, seq<I1...>) { return opus::make_vector(get<I0>(t0)..., get<I1>(t1)...); }
+OPUS_H_D constexpr auto concat_vector(T0 const& t0, T1 const& t1, seq<I0...>, seq<I1...>) {
+    if constexpr (std::is_same_v<remove_cvref_t<T0>, remove_cvref_t<T1>> && sizeof...(I0) > 1) {
+        using R = vector_t<typename vector_traits<remove_cvref_t<T0>>::dtype, sizeof...(I0) + sizeof...(I1)>;
+        return __builtin_bit_cast(R, __builtin_shufflevector(t0, t1, I0..., (sizeof...(I0) + I1)...));
+    } else { return opus::make_vector(get<I0>(t0)..., get<I1>(t1)...); }
+}
 template <class T0, class T1, class T2, index_t... I0, index_t... I1, index_t...I2>
 OPUS_H_D constexpr auto concat_vector(T0 const& t0, T1 const& t1, T2 const& t2, seq<I0...>, seq<I1...>, seq<I2...>) { return opus::make_vector(get<I0>(t0)..., get<I1>(t1)..., get<I2>(t2)...); }
 template <class T0, class T1, class T2, class T3, index_t... I0, index_t... I1, index_t...I2, index_t...I3>
@@ -712,7 +880,7 @@ OPUS_H_D constexpr auto concat_vector(T0 const& t0, T1 const& t1, T2 const& t2, 
 }
 template <class T0> OPUS_H_D  constexpr auto concat_vector(T0 const& t0) { return t0; }
 template <class T0, class T1>
-OPUS_H_D  constexpr auto concat_vector(T0 const& t0, T1 const& t1) { return impl::concat_vector(t0, t1, make_index_seq<T0::size()>{}, make_index_seq<T1::size()>{}); }
+OPUS_H_D  constexpr auto concat_vector(T0 const& t0, T1 const& t1) { return impl::concat_vector(t0, t1, make_index_seq<size<T0>()>{}, make_index_seq<size<T1>()>{}); }
 template <class T0, class T1, class T2>
 OPUS_H_D  constexpr auto concat_vector(T0 const& t0, T1 const& t1, T2 const& t2) { return impl::concat_vector(t0, t1, t2, make_index_seq<T0::size()>{}, make_index_seq<T1::size()>{}, make_index_seq<T2::size()>{}); }
 template <class T0, class T1, class T2, class T3>
@@ -721,8 +889,11 @@ OPUS_H_D  constexpr auto concat_vector(T0 const& t0, T1 const& t1, T2 const& t2,
 template <class T0, class T1, class T2, class T3, class T4, class... Ts>
 OPUS_H_D  constexpr auto concat_vector(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4, Ts const&... ts) { return concat_vector(concat_vector(t0, t1, t2, t3), concat_vector(t4, ts...)); }
 
-template <typename T, std::enable_if_t<is_vector_v<T>, bool> = true> OPUS_H_D constexpr void fill(T& a, typename vector_traits<T>::dtype const& value) { static_for<size<T>()>([&](auto i){ a[i.value] = value; }); }
-template <typename T, std::enable_if_t<is_vector_v<T>, bool> = true> OPUS_H_D constexpr void clear(T& a) { fill(a, static_cast<typename vector_traits<T>::dtype>(0)); }
+template <typename T, std::enable_if_t<is_vector_v<T>, bool> = true> OPUS_H_D constexpr void fill(T& a, typename vector_traits<T>::dtype const& value) {
+    if constexpr (size<T>() <= 4) { static_for<size<T>()>([&](auto i){ a[i.value] = value; }); }
+    else { for (index_t i = 0; i < size<T>(); ++i) a[i] = value; }  // runtime loop for large vectors
+}
+template <typename T, std::enable_if_t<is_vector_v<T>, bool> = true> OPUS_H_D constexpr void clear(T& a) { a = {}; }
 
 namespace impl {
 template<typename T, index_t... Is, std::enable_if_t<is_vector_v<T>, bool> = true>
@@ -750,7 +921,10 @@ OPUS_H_D constexpr auto to_vector(const T& t) { return impl::to_vector_impl(t, m
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // slice
 namespace impl {
-template<typename C, index_t...Is, std::enable_if_t<is_vector_v<C>, bool> = true> OPUS_H_D constexpr auto slice_impl(C&& c, seq<Is...>) { return opus::make_vector(get<Is>(c)...); }
+template<typename C, index_t...Is, std::enable_if_t<is_vector_v<C>, bool> = true> OPUS_H_D constexpr auto slice_impl(C&& c, seq<Is...>) {
+    if constexpr (sizeof...(Is) == 1) return opus::make_vector(get<Is>(c)...);
+    else { using R = vector_t<typename vector_traits<remove_cvref_t<C>>::dtype, sizeof...(Is)>; return __builtin_bit_cast(R, __builtin_shufflevector(c, c, Is...)); }
+}
 template<typename C, index_t...Is, std::enable_if_t<is_array_v<C>, bool> = true>  OPUS_H_D constexpr auto slice_impl(C&& c, seq<Is...>) { return opus::make_array(get<Is>(c)...); }
 template<typename C, index_t...Is, std::enable_if_t<is_tuple_v<C>, bool> = true>  OPUS_H_D constexpr auto slice_impl(C&& c, seq<Is...>) { return opus::make_tuple(get<Is>(c)...); }
 
@@ -760,8 +934,32 @@ OPUS_H_D constexpr auto slice_impl_i(C&& c, Ts... ss) { vector_t<typename vector
 template<index_t len, typename C, typename...Ts, std::enable_if_t<is_array_v<C>, bool> = true>
 OPUS_H_D constexpr auto slice_impl_i(C&& c, Ts... ss) { array<typename C::value_type, len> r;  index_t d = 0;  static_for([&](auto i){r[d++] = c[i]; }, ss...);  return r; }
 
+template<index_t... Is>
+OPUS_H_D constexpr bool is_contiguous_seq(seq<Is...>) {
+    if constexpr (sizeof...(Is) < 2) return true;
+    else { constexpr index_t idx[] = {Is...}; for (index_t i = 1; i < sizeof...(Is); ++i) { if (idx[i] != idx[i - 1] + 1) return false; } return true; }
+}
+
 template<typename C, typename V, index_t...Ds, index_t...Ss, std::enable_if_t<(is_vector_v<C> || is_array_v<C> || is_tuple_v<C>), bool> = true>
-OPUS_H_D constexpr auto set_slice_impl(C&& dst_c, V&& src_c, seq<Ds...>, seq<Ss...>) { ((  dst_c[Ds] = src_c[Ss]), ...); }
+OPUS_H_D constexpr auto set_slice_impl(C&& dst_c, V&& src_c, seq<Ds...>, seq<Ss...>) {
+    using dst_t = remove_cvref_t<C>; using src_t = remove_cvref_t<V>; using scalar = typename vector_traits<dst_t>::dtype;
+    constexpr index_t len = sizeof...(Ds);
+    // Copy at dword granularity for sub-dword scalar types with dword-aligned contiguous slices
+    if constexpr ((is_vector_v<dst_t> || is_array_v<dst_t>) && (is_vector_v<src_t> || is_array_v<src_t>) && is_contiguous_seq(seq<Ds...>{}) && is_contiguous_seq(seq<Ss...>{}) && sizeof(scalar) < 4 && len > 1) {
+        constexpr index_t epd = 4 / sizeof(scalar);
+        constexpr index_t d0 = seq<Ds...>::at(number<0>{}), s0 = seq<Ss...>::at(number<0>{}), dn = vector_traits<dst_t>::size(), sn = vector_traits<src_t>::size();
+        if constexpr (d0 % epd == 0 && s0 % epd == 0 && len % epd == 0 && dn % epd == 0 && sn % epd == 0) {
+            auto dst_i32 = __builtin_bit_cast(vector_t<int, dn / epd>, dst_c);
+            const auto src_i32 = __builtin_bit_cast(vector_t<int, sn / epd>, src_c);
+            static_for<len / epd>([&](auto i) { dst_i32[d0 / epd + i.value] = src_i32[s0 / epd + i.value]; });
+            dst_c = __builtin_bit_cast(dst_t, dst_i32); return;
+        }
+    }
+    if constexpr (is_contiguous_seq(seq<Ds...>{}) && is_contiguous_seq(seq<Ss...>{}) && (is_vector_v<dst_t> || is_array_v<dst_t>) && len > 2) {
+        constexpr index_t d0 = seq<Ds...>::at(number<0>{}), s0 = seq<Ss...>::at(number<0>{});
+        for (index_t i = 0; i < len; ++i) dst_c[d0 + i] = src_c[s0 + i];  // runtime loop avoids N-element fold instantiation
+    } else { ((dst_c[Ds] = src_c[Ss]), ...); }
+}
 }
 
 // static/dynamic slice. SS could be either number<x>, or const integer. Note tuple type does not support dynamic slice (ss is integral)
@@ -826,6 +1024,8 @@ REGISTER_DTYPE(u16 , unsigned short)
 #endif
 REGISTER_DTYPE(i8  , signed char)
 REGISTER_DTYPE(u8  , unsigned char)
+REGISTER_DTYPE(i64 , long long)
+REGISTER_DTYPE(u64 , unsigned long long)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 // numeric_limits -- returns min/max/lowest/quiet_nan/infinity in the *original* dtype
@@ -1009,8 +1209,8 @@ OPUS_D constexpr unsigned short fp32_to_bf16_rtn_raw(float f)
     else if(bits & 0xffff) { bits |= 0x10000; /* Preserve signaling NaN */ }
     return static_cast<unsigned short>(bits >> 16);
 }
-#if (defined(__gfx950__) || defined(__gfx1250__)) && __clang_major__ >= 20
-template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx1250 has instruction conversion, leave 'rm' here for compatiblity
+#if (defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)) && __clang_major__ >= 20
+template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx1250/gfx12 has instruction conversion, leave 'rm' here for compatiblity
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) { return static_cast<bf16_t>(x); }
 #else
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // 0:standard, 1:truncate_with_nan, 2:truncate, 3:standard asm 4:rta_asm(round to nearest away)
@@ -1030,12 +1230,22 @@ OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
 // Template constexpr (packed variants, OPUS_CAST_DEFINE) survives because the check is deferred to instantiation.
 // TODO: we may remove constexpr from cast in the future
 OPUS_D auto fp32_to_fp8(const fp32_t& x) {
+#if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
+    // RDNA3/3.5 (gfx1100/gfx115x) lack fp8-conversion-insts; compile-only
+    // stub so headers build. BF16 code paths never invoke fp8 conversion.
+    (void)x; return __builtin_bit_cast(fp8_t, static_cast<signed char>(0));
+#else
     int w; w = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, w, /*sel=lo*/0);
     return __builtin_bit_cast(fp8_t, static_cast<signed char>(w));
+#endif
 }
 OPUS_D auto fp8_to_fp32(const fp8_t& x) {
+#if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
+    (void)x; return fp32_t(0.0f);
+#else
     int w = static_cast<int>(__builtin_bit_cast(unsigned char, x));
     return __builtin_amdgcn_cvt_f32_fp8(w, /*byte=*/0);
+#endif
 }
 OPUS_D constexpr auto fp32_to_fp32(const fp32_t& x) { return x; }
 OPUS_D constexpr auto fp32_to_i8(const fp32_t& x) { return static_cast<i8_t>(x); }
@@ -1054,42 +1264,6 @@ OPUS_CAST_DEFINE(fp32, fp32)
 OPUS_CAST_DEFINE(i8, fp32)
 OPUS_CAST_DEFINE(fp32, i8)
 
-namespace impl {
-// implement a "pack" of data, storage should pad to multiple of byte(8bit)
-template<typename storage_, unsigned int bits_, bool is_signed_ = true>
-struct dpacks {
-    using storage = remove_cvref_t<storage_>;
-    static constexpr unsigned int bits = bits_;
-    static constexpr unsigned int mask = (1 << bits) - 1;
-    static constexpr bool is_signed = is_signed_;
-    static constexpr unsigned int num_packs = sizeof(storage) * 8 / bits;   // we will not check if evenly divided or not here
-    OPUS_H_D                     constexpr storage operator[](index_t i) const { return (value >> (i * bits)) & mask; } // NOTE: not efficient, better use v_bfi/v_bfe/v_perm on device
-    template<index_t I> OPUS_H_D constexpr storage operator[](number<I>) const { return (value >> (I * bits)) & mask; } // NOTE: not efficient, better use v_bfi/v_bfe/v_perm on device
-    storage value;
-};
-
-template<typename storage_, unsigned int bits_, unsigned int exp_bits_, unsigned int mantissa_bits_, bool is_signed_ = true>
-struct fpacks : dpacks<storage_, bits_, is_signed_> {
-    static constexpr unsigned int exp_bits = exp_bits_;
-    static constexpr unsigned int mantissa_bits = mantissa_bits_;
-};
-} // namespace impl
-
-template <typename> struct is_packs : false_type {};
-template <typename S, unsigned int B, bool X> struct is_packs<impl::dpacks<S, B, X>> : true_type {};
-template <typename S, unsigned int B, unsigned int E, unsigned int M, bool X> struct is_packs<impl::fpacks<S, B, E, M, X>> : true_type {};
-template <typename T> static constexpr bool is_packs_v = is_packs<remove_cvref_t<T>>::value;
-
-// how many real data within one byte
-template <typename T, typename = void> struct num_packs { static constexpr int value = 1; };
-template <typename T> struct num_packs<T, std::enable_if_t<is_packs_v<T>>> { static constexpr int value = T::num_packs; };
-template <typename T> static constexpr int num_packs_v = num_packs<T>::value;
-
-template <typename T> struct sizeof_bits { static constexpr int value = int(sizeof(T) * 8); };
-template <> struct sizeof_bits<void> { static constexpr int value = 0; };
-template <typename S, unsigned int B, bool X> struct sizeof_bits<impl::dpacks<S, B, X>> { static constexpr int value = impl::dpacks<S, B, X>::bits; };
-template <typename S, unsigned int B, unsigned int E, unsigned int M, bool X> struct sizeof_bits<impl::fpacks<S, B, E, M, X>> { static constexpr int value = impl::fpacks<S, B, E, M, X>::bits; };
-template <class T> static constexpr auto sizeof_bits_v = sizeof_bits<T>::value;
 
 #define OPUS_DEFINE_DPACKS(name_, storage_, bits_, is_signed_) \
     struct name_ : opus::impl::dpacks<storage_, bits_, is_signed_> { using base = opus::impl::dpacks<storage_, bits_, is_signed_>; };  \
@@ -1099,12 +1273,11 @@ template <class T> static constexpr auto sizeof_bits_v = sizeof_bits<T>::value;
     struct name_ : opus::impl::fpacks<storage_, bits_, exp_bits_, mantissa_bits_, is_signed_> {using base = opus::impl::fpacks<storage_, bits_, exp_bits_, mantissa_bits_, is_signed_>; };  \
     template<> struct sizeof_bits<name_> { static constexpr int value = name_::bits; }; template<> struct is_packs<name_> : true_type {}; template<> struct is_dtype<name_> : true_type {};
 
-// NOTE: convention here. The subbyte type below is indeed "packed" data. e.g. fp4_t, underneath it is fp4x2 in one byte, but we don't name it this way
-// This is different from cutlass convention (e.g float4_e2m1_t, but storage is unsigned char, hence an array of float4_e2m1_t will be expanded), and different from ck convention(explicitly name it fp4x2_t)
-OPUS_DEFINE_DPACKS(int4_t , unsigned char, 4, true)           // int4x2
-OPUS_DEFINE_DPACKS(uint4_t, unsigned char, 4, false)          // uint4x2
-OPUS_DEFINE_FPACKS(fp4_t,   unsigned char, 4, 2, 1, true)     // fp4x2
-OPUS_DEFINE_FPACKS(e8m0_t,  unsigned char, 8, 8, 0, false)    // fp4x2
+// cutlass-style convention: each type below is ONE logical element (full byte standalone, sizeof_bits==4), and only opus::array/vector bit-pack it -- so array<fp4_t,N> is N values in ceil(N*4/8) bytes (vs the ck fp4x2_t pack).
+OPUS_DEFINE_DPACKS(int4_t , unsigned char, 4, true)           // one int4  element
+OPUS_DEFINE_DPACKS(uint4_t, unsigned char, 4, false)          // one uint4 element
+OPUS_DEFINE_FPACKS(fp4_t,   unsigned char, 4, 2, 1, true)     // one fp4 (e2m1) element
+OPUS_DEFINE_FPACKS(e8m0_t,  unsigned char, 8, 8, 0, false)    // one e8m0 scale (8-bit)
 
 // finfo specializations for subbyte/packed types (defined after OPUS_DEFINE_FPACKS)
 // fp4 E2M1: 1 sign, 2 exp, 1 mantissa, bias=1
@@ -1197,30 +1370,30 @@ OPUS_D constexpr auto unfold_from_container(const Tup& tup) {
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
     u32_t w; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[0], s[1], scale, sel);
-    return __builtin_bit_cast(array<fp4_t, 1>, static_cast<u8_t>(w));
+    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u8_t>(w));
 }
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& s, float scale = 1.0f) {
     u32_t w; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[0], s[1], scale, 0); w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[2], s[3], scale, 1);
-    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u16_t>(w));
+    return __builtin_bit_cast(array<fp4_t, 4>, static_cast<u16_t>(w));
 }
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& s, float scale = 1.0f) {
     u32_t w; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[0], s[1], scale, 0); w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[2], s[3], scale, 1);
     w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[4], s[5], scale, 2); w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[6], s[7], scale, 3);
-    return __builtin_bit_cast(array<fp4_t, 4>, w);
+    return __builtin_bit_cast(array<fp4_t, 8>, w);
 }
-template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>
+template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
     return __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(static_cast<u32_t>(__builtin_bit_cast(u8_t, s)), scale, sel);
 }
-template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x4(const S& s, float scale = 1.0f) {
     auto ss = static_cast<u32_t>(__builtin_bit_cast(u16_t, s));
     auto x = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 0); auto y = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 1);
     return fp32x4_t{x[0], x[1], y[0], y[1]};
 }
-template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 1.0f) {
     auto ss = static_cast<u32_t>(__builtin_bit_cast(u32_t, s));
     auto x = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 0); auto y = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 1);
@@ -1230,12 +1403,11 @@ OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 
 
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
-    union { unsigned int bitwise; fp4_t fp4_pack[4]; } value;
-    value.bitwise = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(value.bitwise, s, scale, sel);
-    return value.fp4_pack[0];
+    u32_t w{}; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(w, s, scale, sel);
+    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u8_t>(w));   // low byte = 2 packed fp4
 }
-template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>
-OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) { return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(s, scale, sel); }
+template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>
+OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) { return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(static_cast<u32_t>(__builtin_bit_cast(u8_t, s)), scale, sel); }
 #elif defined(__gfx1250__)
 // gfx1250: pk8 builtins convert 8 fp4 <-> 8 f32 at once
 // f32->fp4: __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v8f32 src, float scale) -> i32
@@ -1246,34 +1418,34 @@ template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_
 OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
     fp32x8_t v{s[0], s[1], 0, 0, 0, 0, 0, 0};
     u32_t w = __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v, scale);
-    return __builtin_bit_cast(array<fp4_t, 1>, static_cast<u8_t>(w));
+    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u8_t>(w));
 }
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& s, float scale = 1.0f) {
     fp32x8_t v{s[0], s[1], s[2], s[3], 0, 0, 0, 0};
     u32_t w = __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v, scale);
-    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u16_t>(w));
+    return __builtin_bit_cast(array<fp4_t, 4>, static_cast<u16_t>(w));
 }
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& s, float scale = 1.0f) {
     u32_t w = __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(s, scale);
-    return __builtin_bit_cast(array<fp4_t, 4>, w);
+    return __builtin_bit_cast(array<fp4_t, 8>, w);
 }
-template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>
+template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
     i32_t e = (__builtin_bit_cast(i32_t, scale) >> 23) & 0xFF;
     i32_t scale_e8m0 = e * static_cast<i32_t>(0x01010101);
     fp32x8_t r = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(static_cast<i32_t>(__builtin_bit_cast(u8_t, s)), scale_e8m0, 0);
     return fp32x2_t{r[0], r[1]};
 }
-template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x4(const S& s, float scale = 1.0f) {
     i32_t e = (__builtin_bit_cast(i32_t, scale) >> 23) & 0xFF;
     i32_t scale_e8m0 = e * static_cast<i32_t>(0x01010101);
     fp32x8_t r = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(static_cast<i32_t>(__builtin_bit_cast(u16_t, s)), scale_e8m0, 0);
     return fp32x4_t{r[0], r[1], r[2], r[3]};
 }
-template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 1.0f) {
     i32_t e = (__builtin_bit_cast(i32_t, scale) >> 23) & 0xFF;
     i32_t scale_e8m0 = e * static_cast<i32_t>(0x01010101);
@@ -1282,18 +1454,18 @@ OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 
 }
 // bf16<->fp4 stubs for gfx1250 (no pk bf16<->fp4 builtins available)
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>
-OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return fp4_t{}; }
-template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return array<fp4_t, 2>{}; }
+template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return bf16x2_t{}; }
 #else
-template<typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 1>{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 2>{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 4>{}; }
-template<typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x2_t{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x4_t{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x8_t{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return fp4_t{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return bf16x2_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 2>{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 4>{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 8>{}; }
+template<typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x2_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x4_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x8_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 2>{}; }
+template<typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return bf16x2_t{}; }
 #endif
 #pragma clang diagnostic pop
 
@@ -1312,18 +1484,18 @@ template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp32_to_fp4_packed_x4(s, std::forward<Aux>(aux)...); }
 template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp32x8_t> && std::is_same_v<D, fp4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp32_to_fp4_packed_x8(s, std::forward<Aux>(aux)...); }
-template<typename D, typename S, typename... Aux, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>> && std::is_same_v<D, fp32_t>, bool> = true>
+template<typename D, typename S, typename... Aux, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>> && std::is_same_v<D, fp32_t>, bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp4_to_fp32_packed_x2(s, std::forward<Aux>(aux)...); }
-template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>> && std::is_same_v<D, fp32_t>, bool> = true>
-OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp4_to_fp32_packed_x4(s, std::forward<Aux>(aux)...); }
 template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>> && std::is_same_v<D, fp32_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp4_to_fp32_packed_x4(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>> && std::is_same_v<D, fp32_t>, bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp4_to_fp32_packed_x8(s, std::forward<Aux>(aux)...); }
 
 namespace impl {
 // rocm-7.1.1, when there are multiple invokes of this kernel (across different __global__ in same compile target ?) will fail to inline below function
 template<typename D, typename S, index_t... Is, typename... Aux, std::enable_if_t<is_vector_v<S>, bool> = true>
 OPUS_D constexpr decltype(auto) cast_impl(const S& s, seq<Is...>, Aux&&... aux) {
-    return impl::vector_return_type<void, decltype(cast<D>(get<Is>(s), std::forward<Aux>(aux)...))...>{cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...}; }
+    return impl::vector_return_type<D, decltype(cast<D>(get<Is>(s), std::forward<Aux>(aux)...))...>{cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...}; }
     //return opus::make_vector(cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...); }
 template<typename D, typename S, index_t... Is, typename... Aux, std::enable_if_t<is_tuple_v<S>, bool> = true>
 OPUS_D constexpr decltype(auto) cast_impl(const S& s, seq<Is...>, Aux&&... aux) {
@@ -1349,12 +1521,14 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp8_t>  && size<S>() % 2 == 0 && std::is_same_v<D, fp32_t>) { // fp8 -> fp32, x2N
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
+    else if constexpr (is_vector_v<S> && size<S>() > 16 && sizeof...(Aux) == 0) {
+        return __builtin_convertvector(s, vector_t<D, size<S>()>); }
     else   return impl::cast_impl<D>(s, make_index_seq<size<S>()>{}, std::forward<Aux>(aux)...); }
 
 // entry point for vectorized cast(), for dpacks
 template<typename D, typename S, typename... Aux, std::enable_if_t<((is_vector_v<S> || is_tuple_v<S> || is_array_v<S>) && (is_packs_v<D> || is_packs_v<get_value_t<S>>))
     && !(is_any_of_v<S, fp32x2_t, fp32x4_t, fp32x8_t> && std::is_same_v<D, fp4_t >)         // fp32
-    && !(is_any_of_v<S, fp4_t, array<fp4_t, 1>, array<fp4_t, 2>, array<fp4_t, 4>, tuple_array<fp4_t, 1>, tuple_array<fp4_t, 2>, tuple_array<fp4_t, 4>> && std::is_same_v<D, fp32_t>)
+    && !(is_any_of_v<S, fp4_t, array<fp4_t, 2>, array<fp4_t, 4>, array<fp4_t, 8>, tuple_array<fp4_t, 2>, tuple_array<fp4_t, 4>, tuple_array<fp4_t, 8>> && std::is_same_v<D, fp32_t>)
 , bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
     constexpr index_t num_packs_ = [&](){   // TODO: how to consider both D and S are packs?
@@ -1366,9 +1540,11 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 2 == 0 && std::is_same_v<D, fp4_t>) { // fp32 -> fp4 , x2N
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
-    else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 4 == 0) { // fp4 -> fp32 , x8N
+    else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 8 == 0) { // fp4 -> fp32 , 8 values/group
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<8>{}), make_index_seq<size<S>() / 8>{}, std::forward<Aux>(aux)...)); }
+    else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 4 == 0) { // fp4 -> fp32 , 4 values/group
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
-    else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 2 == 0) { // fp4 -> fp32 , x4N
+    else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 2 == 0) { // fp4 -> fp32 , 2 values/group
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
     else            return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<num_packs_>{}), make_index_seq<size<S>() / num_packs_>{}, std::forward<Aux>(aux)...));
 }
@@ -1403,11 +1579,22 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
 //   Guarded by OPUS_ENABLE_RUNTIME_QUERY (default 0). Define OPUS_ENABLE_RUNTIME_QUERY=1 before
 //   including opus.hpp (or via compiler flag) to enable these functions and the hip_runtime_api.h include.
 //
+// gfx12 wave32/64 detection: __AMDGCN_WAVEFRONT_SIZE__ removed in ROCm 7.2; _w32 builtins are gated by wavefrontsize32 target feature, so __has_builtin is a constexpr proxy.
+#if (defined(__gfx1201__) || defined(__gfx1200__)) && defined(__HIP_DEVICE_COMPILE__)
+#  if __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
+#    define OPUS_GFX120X_IS_WAVE32 1
+#  else
+#    define OPUS_GFX120X_IS_WAVE32 0
+#  endif
+#endif
+
 OPUS_H_D constexpr index_t get_warp_size()
 {
 #if defined(__gfx1250__)
     return 32;
 #elif defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
+    return 64;
+#elif defined(OPUS_GFX120X_IS_WAVE32) && !OPUS_GFX120X_IS_WAVE32
     return 64;
 #else
     return 32;
@@ -1421,6 +1608,39 @@ OPUS_H_D constexpr index_t get_smem_size()
     return 65536;   // 64KB
 #endif
 }
+
+// ---- Device intrinsic wrappers ----
+// Replace HIP runtime macros (threadIdx.x, __syncthreads, __all, etc.) so kernels compile
+// with just #include <opus/opus.hpp> -- no <hip/hip_runtime.h> needed.
+OPUS_D index_t thread_id_x() { return __builtin_amdgcn_workitem_id_x(); }
+OPUS_D index_t thread_id_y() { return __builtin_amdgcn_workitem_id_y(); }
+OPUS_D index_t thread_id_z() { return __builtin_amdgcn_workitem_id_z(); }
+OPUS_D index_t block_id_x()  { return __builtin_amdgcn_workgroup_id_x(); }
+OPUS_D index_t block_id_y()  { return __builtin_amdgcn_workgroup_id_y(); }
+OPUS_D index_t block_id_z()  { return __builtin_amdgcn_workgroup_id_z(); }
+OPUS_D index_t block_size_x() { return __builtin_amdgcn_workgroup_size_x(); }
+OPUS_D index_t block_size_y() { return __builtin_amdgcn_workgroup_size_y(); }
+OPUS_D index_t block_size_z() { return __builtin_amdgcn_workgroup_size_z(); }
+#if defined(__gfx1250__)
+OPUS_D index_t cluster_workgroup_id_x() {return __builtin_amdgcn_cluster_workgroup_id_x();}
+OPUS_D index_t cluster_workgroup_id_y() {return __builtin_amdgcn_cluster_workgroup_id_y();}
+OPUS_D index_t cluster_workgroup_id_z() {return __builtin_amdgcn_cluster_workgroup_id_z();}
+OPUS_D index_t cluster_workgroup_flat_id() {return __builtin_amdgcn_cluster_workgroup_flat_id();}
+OPUS_D index_t cluster_id_x() {return __builtin_amdgcn_cluster_id_x();}
+OPUS_D index_t cluster_id_y() {return __builtin_amdgcn_cluster_id_y();}
+OPUS_D index_t cluster_id_z() {return __builtin_amdgcn_cluster_id_z();}
+#endif
+// grid x-z switch to cluster_id when cluster enable in gfx1250
+OPUS_D index_t grid_size_x()  { return __builtin_amdgcn_grid_size_x(); }
+OPUS_D index_t grid_size_y()  { return __builtin_amdgcn_grid_size_y(); }
+OPUS_D index_t grid_size_z()  { return __builtin_amdgcn_grid_size_z(); }
+OPUS_D void    sync_threads() { __builtin_amdgcn_s_barrier(); }
+#if !defined(HIP_INCLUDE_HIP_AMD_DETAIL_DEVICE_LIBRARY_DECLS_H)
+extern "C" __device__ int __ockl_wfall_i32(int);
+#endif
+#if !defined(HIP_INCLUDE_HIP_AMD_DETAIL_WARP_FUNCTIONS_H)
+OPUS_D int     warp_all(int predicate) { return __ockl_wfall_i32(predicate); }
+#endif
 
 #if OPUS_ENABLE_RUNTIME_QUERY
 OPUS_H index_t query_warp_size() { int d; (void)hipGetDevice(&d); hipDeviceProp_t p; (void)hipGetDeviceProperties(&p, d); return static_cast<index_t>(p.warpSize); }
@@ -1474,6 +1694,34 @@ OPUS_D unsigned int lane_id() {
     else return __builtin_amdgcn_mbcnt_hi(-1, __builtin_amdgcn_mbcnt_lo(-1, 0));
 }
 
+//gfx1250 only feature. Named-barrier / cluster-sync builtins + __amdgpu_named_workgroup_barrier_t only exist on clang>=22 (ROCm>=7.2); gate the host pass too so clang-20 (ROCm 7.1) CI does not parse them.
+#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+OPUS_D u32_t waveid_in_workgroup() { u32_t wave_id; asm volatile("s_bfe_u32 %0, ttmp8, 0x50019" : "=s"(wave_id)); return wave_id; }
+
+//Named Barrier define
+#define DECLARE_NAMED_BARRIERS() \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_1; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_2; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_3; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_4; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_5; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_6; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_7; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_8; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_9; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_10; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_11; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_12; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_13; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_14; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_15; 
+
+OPUS_D void s_barrier_init_ptr(__amdgpu_named_workgroup_barrier_t* bar, u32_t member_cnt) { __builtin_amdgcn_s_barrier_init(bar, member_cnt); }
+OPUS_D void s_barrier_join_ptr(__amdgpu_named_workgroup_barrier_t* bar)                      { __builtin_amdgcn_s_barrier_join(bar); }
+OPUS_D void sync_cluster()   { __builtin_amdgcn_s_barrier_signal(-3); __builtin_amdgcn_s_barrier_wait(-3); }
+OPUS_D void sync_workgroup() { __builtin_amdgcn_s_barrier_signal(-1); __builtin_amdgcn_s_barrier_wait(-1); }
+#endif
+
 // cross-lane shuffle via ds_bpermute (no hip_runtime.h dependency)
 template<typename T>
 OPUS_D T shfl(T var, int src_lane, int width = get_warp_size()) {
@@ -1496,7 +1744,8 @@ OPUS_D constexpr auto buffer_default_config() {
     return 0x00020000;
 #elif defined(__gfx103__)
     return 0x31014000;
-#elif defined(__gfx11__) || defined(__gfx12__) || defined(__gfx1250__)
+// gfx1200/gfx1201 (Navi 44/48) listed explicitly -- __gfx11__/__gfx12__ are typos (clang predefines only uppercase __GFX11__/__GFX12__), so without this gfx1200/gfx1201 fall into the 0xffffffff sentinel and make_gmem<> stores silently drop.
+#elif defined(__gfx11__) || defined(__gfx12__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)
     return 0x31004000;
 #else
     return 0xffffffff;
@@ -1511,6 +1760,75 @@ OPUS_D __amdgpu_buffer_rsrc_t make_buffer_rsrc(const void* ptr, unsigned int siz
 OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR unsigned int* p, index_t size, index_t vos, index_t sos, index_t ios, index_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
 #pragma clang diagnostic pop
 #endif
+
+// ── buffer atomic feature guards ───────────────────────────────────────────────
+// per BuiltinsAMDGPU.td / IntrinsicsAMDGPU.td:
+//   fadd.f32     : atomic-fadd-rtn-insts                 (gfx908+, incl. gfx942/gfx950/gfx1250)
+//   fadd.v2f16   : atomic-buffer-global-pk-add-f16-insts (gfx942/gfx950/gfx1250)
+//   fadd.v2bf16  : raw_buffer_atomic_fadd<v2bf16>        (gfx90a/gfx942/gfx950/gfx12+; gated to gfx950/gfx1250 per request)
+//   fmin/fmax.f32: atomic-fmin-fmax-global-f32           (gfx950/gfx1250)
+#if defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1200__) || defined(__gfx1201__)
+#define OPUS_HAS_BUFFER_ATOMIC_FADD_F32 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_FADD_F32 0
+#endif
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__)
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 0
+#endif
+#if defined(__gfx950__) || defined(__gfx1250__)
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16 0
+#endif
+#if defined(__gfx950__) || defined(__gfx1250__)
+#define OPUS_HAS_BUFFER_ATOMIC_FMINMAX_F32 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_FMINMAX_F32 0
+#endif
+
+// __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_{f32,v2f16} (opaque rsrc) only exist on clang>=22 / ROCm>=7.2; __has_builtin picks the builtin where present, else the __asm LLVM-intrinsic fallback (i32x4 rsrc, below) -- no -D flag or version literal needed.
+#ifndef OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_raw_ptr_buffer_atomic_fadd_f32)
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN 1
+#else
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN 0
+#endif
+#endif
+#ifndef OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_raw_ptr_buffer_atomic_fadd_v2f16)
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN 1
+#else
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN 0
+#endif
+#endif
+
+// No clang builtin for these (only global/flat/ds, never raw_(ptr_)buffer), so each binds the LLVM IR int_amdgcn_raw_buffer_atomic_* via __asm under one -Wundefined-inline silence; rsrc is the i32x4 form (memcpy'd, non-copyable): fadd.v2bf16=packed bf16 add, cmpswap.i32=32-bit CAS (emulates pk fadd where unsupported), add.i32=i32 add (aux drives returning-bit+scope).
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundefined-inline"
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16
+OPUS_D bf16x2_t llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(bf16x2_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.v2bf16");
+#endif
+// fadd.f32 / fadd.v2f16 __asm fallbacks for toolchains without the raw_ptr builtins (clang < 22).
+#if OPUS_HAS_BUFFER_ATOMIC_FADD_F32 && !OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN
+OPUS_D fp32_t llvm_amdgcn_raw_buffer_atomic_fadd_f32(fp32_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.f32");
+#endif
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 && !OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
+OPUS_D fp16x2_t llvm_amdgcn_raw_buffer_atomic_fadd_v2f16(fp16x2_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.v2f16");
+#endif
+OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_cmpswap_i32(i32_t src, i32_t cmp, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.cmpswap.i32");
+OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_add_i32(i32_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.add.i32");
+#pragma clang diagnostic pop
+
+#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+enum class atomic_scope : u8_t { cu=0, se=1, dev=2, sys=3 };   // VMEM cache scope[4:3] for atomics
+// RMW-atomic cpol (NOT make_cpol's load hints): TH[0]=returning (1=>returns pre-op value, tracked by LOADcnt; 0=>non-ret, STOREcnt), TH[1]=NT, TH[2]=cascade (defer scope of non-ret atomics; keep 0 for gates), scope[4:3]=cu/se/dev/sys (cross-cluster needs >=dev).
+OPUS_H_D constexpr int make_atomic_cpol(atomic_scope sc = atomic_scope::dev, bool returning = true, bool nt = false, bool cascade = false) { return (returning ? 1 : 0) | (nt ? (1 << 1) : 0) | (cascade ? (1 << 2) : 0) | ((int(sc) & 0x3) << 3); }
+static_assert(make_atomic_cpol(atomic_scope::dev, true, true, false) == 19, "atomic cpol layout drift");
+static_assert(make_atomic_cpol(atomic_scope::sys, false, false, false) == 24, "atomic cpol layout drift");
+#endif
+
 template<typename T_>
 struct gmem {
     using T = remove_cvref_t<T_>;
@@ -1535,42 +1853,51 @@ struct gmem {
         else if constexpr (sizeof(type) == 16) { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os, s_os, aux)); }
     }
 
-    template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
-    OPUS_D void _async_load(OPUS_LDS_ADDR void* dst, int v_os, int s_os = 0, number<aux> = {}) {
+    // Async copy global -> LDS. Offsets are in bytes.
+    // IMPORTANT - i_os shifts BOTH ends of the copy, not just the source.
+    template<index_t vec = 1, index_t i_os = 0, index_t aux = 0>
+    OPUS_D void _async_load(OPUS_LDS_ADDR void* dst, int v_os, int s_os = 0, number<i_os> = {}, number<aux> = {}) {
         using type = vector_type<vec>;
 #if defined(__gfx1250__)
-        // gfx1250: global_load_async_to_lds (global addressing, not buffer rsrc)
+        static_assert(i_os >= 0 && i_os <= (1 << 23) - 1, "_async_load: i_os exceeds gfx1250 VGLOBAL IOFFSET range [0, 2^23 - 1]");
         #define GPTR_(T, p) ((__attribute__((address_space(1))) T*)(p))
         #define LPTR_(T, p) ((OPUS_LDS_ADDR T*)(p))
         {
             auto* src = raw_ptr + v_os + s_os;
-            if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), 0, 0); }
-            else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), 0, 0);
-                                                     __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src + 1), LPTR_(char, (char*)dst + 1), 0, 0); }
-            else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_global_load_async_to_lds_b32 (GPTR_(int, src), LPTR_(int, dst), 0, 0); }
-            else if constexpr (sizeof(type) == 8)  { __builtin_amdgcn_global_load_async_to_lds_b64 (GPTR_(i32x2_t, src), LPTR_(i32x2_t, dst), 0, 0); }
-            else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_global_load_async_to_lds_b128(GPTR_(i32x4_t, src), LPTR_(i32x4_t, dst), 0, 0); }
+            if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), i_os, 0); }
+            else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), i_os, 0);
+                                                     __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src + 1), LPTR_(char, (char*)dst + 1), i_os, 0); }
+            else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_global_load_async_to_lds_b32 (GPTR_(int, src), LPTR_(int, dst), i_os, 0); }
+            else if constexpr (sizeof(type) == 8)  { __builtin_amdgcn_global_load_async_to_lds_b64 (GPTR_(i32x2_t, src), LPTR_(i32x2_t, dst), i_os, 0); }
+            else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_global_load_async_to_lds_b128(GPTR_(i32x4_t, src), LPTR_(i32x4_t, dst), i_os, 0); }
         }
         #undef GPTR_
         #undef LPTR_
-#elif __clang_major__ >= 20   // start from rocm 7.0,introduced by https://github.com/llvm/llvm-project/pull/132048, 133055, 132957
-        if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  4, v_os, s_os, 0, aux); }
+#elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__)   // CDNA: buffer-load lands directly in LDS (vmem-to-lds-load-insts).
+        static_assert(i_os >= 0 && i_os <= (1 << 12) - 1, "_async_load: i_os exceeds CDNA MUBUF OFFSET range [0, 2^12 - 1]");
+#if __clang_major__ >= 20    // clang 20+ raw_ptr builtin (rocm 7.0+)
+        if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  4, v_os, s_os, i_os, aux); }
 #if  defined(__gfx950__)
-        else if constexpr (sizeof(type) == 12) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 12, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 16, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 12) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 12, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 16, v_os, s_os, i_os, aux); }
 #endif
 #else
         i32x4_t cached_rsrc_;
         __builtin_memcpy(&cached_rsrc_, &cached_rsrc, sizeof(i32x4_t));   // builtin memcpy, __builtin_bit_cast() can not use here due to __amdgpu_buffer_rsrc_t is non copyable
-        if      constexpr (sizeof(type) == 1)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  1, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 2)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  2, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 4)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  4, v_os, s_os, 0, aux); }
+        if      constexpr (sizeof(type) == 1)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  1, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 2)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  2, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 4)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  4, v_os, s_os, i_os, aux); }
 #if  defined(__gfx950__)
-        else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 12, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 16, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 12, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 16, v_os, s_os, i_os, aux); }
 #endif
+#endif
+#else
+        auto val = _load<vec, aux>(v_os + i_os, s_os, number<aux>{});
+        dst = reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<__UINTPTR_TYPE__>(dst) + i_os);
+        *reinterpret_cast<OPUS_LDS_ADDR type*>(dst) = val;
 #endif
     }
 
@@ -1581,14 +1908,94 @@ struct gmem {
         else if constexpr (sizeof(vector_type<vec>) == 2)  { __builtin_amdgcn_raw_buffer_store_b16 (__builtin_bit_cast(i16_t,   x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 4)  { __builtin_amdgcn_raw_buffer_store_b32 (__builtin_bit_cast(i32_t,   x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 8)  { __builtin_amdgcn_raw_buffer_store_b64 (__builtin_bit_cast(i32x2_t, x), cached_rsrc, v_os, s_os, aux); }
-        else if constexpr (sizeof(vector_type<vec>) == 16) { __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux); }
+        else if constexpr (sizeof(vector_type<vec>) == 16) {
+#if defined(__gfx1250__) && (__clang_major__ <= 22)
+            // clang<=22 (HIP<=7.2) miscompiles bounded b128 store under high C-store reg expansion (large gfx1250 clusterlaunch tiles, e.g. 128x128): sinks the uniform voffset part into the buffer BASE via readfirstlane, corrupting high address bits and bypassing the num_records bound -> OOB fault. Inline-asm barrier keeps voffset opaque so the full offset stays in the bounds-checked VGPR. Fixed in clang-23/HIP 7.14, where this branch compiles out.
+            int vo_ = v_os;
+            asm volatile("" : "+v"(vo_));
+            __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, vo_, s_os, aux);
+#else
+            __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux);
+#endif
+        }
+    }
+
+    // CAS-loop fallback: emulate a packed fp16/bf16 atomic-add on the 32-bit word at (vo,s_os) when the arch lacks native pk_add -- read the word, add in fp32, write back via cmpswap, retry until the compare succeeds. add_pk is the increment as an fp32x2 (lo,hi lanes).
+    template<typename Pk>
+    OPUS_D Pk _atomic_pk_add_cas(const Pk& add_pk, int vo, int s_os, index_t aux) {
+        i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));
+        i32_t old = __builtin_bit_cast(i32_t, _load<1>(vo, s_os, number<0>{}));   // seed with a normal read of the word
+        i32_t assumed;
+        do {
+            assumed = old;
+            Pk cur = __builtin_bit_cast(Pk, assumed);
+            Pk nxt;
+            if constexpr (std::is_same_v<scalar_type, bf16_t>) {
+                nxt[0] = fp32_to_bf16(bf16_to_fp32(cur[0]) + bf16_to_fp32(add_pk[0]));
+                nxt[1] = fp32_to_bf16(bf16_to_fp32(cur[1]) + bf16_to_fp32(add_pk[1]));
+            } else { // fp16
+                nxt[0] = fp32_to_fp16(fp16_to_fp32(cur[0]) + fp16_to_fp32(add_pk[0]));
+                nxt[1] = fp32_to_fp16(fp16_to_fp32(cur[1]) + fp16_to_fp32(add_pk[1]));
+            }
+            old = llvm_amdgcn_raw_buffer_atomic_cmpswap_i32(__builtin_bit_cast(i32_t, nxt), assumed, rsrc_, vo, s_os, aux);
+        } while (old != assumed);
+        return __builtin_bit_cast(Pk, old);
+    }
+
+    // buffer atomic add. v_os/ioffset in BYTES (ioffset compile-time -> folded into the immediate offset: field, v_os stays in a VGPR). Returns the old value. Dispatch on (scalar_type,total): f32x1/f16x2/bf16x2/i32x1/u32x1; packed types fall back to a cmpswap loop on archs lacking native pk_add.
+    template<index_t vec = 1, index_t ioffset = 0, typename V, index_t aux = 0>   // os in unit of byte
+    OPUS_D auto _atomic_add(const V& x, int v_os, int s_os = 0, number<ioffset> = {}, number<aux> = {}) {
+        using type = vector_type<vec>;
+        constexpr index_t total = vec * vector_size;
+        const int vo = v_os + ioffset;
+        static_assert((std::is_same_v<scalar_type, fp32_t> && total == 1) ||
+                      (std::is_same_v<scalar_type, fp16_t> && total == 2) ||
+                      (std::is_same_v<scalar_type, bf16_t> && total == 2) ||
+                      ((std::is_same_v<scalar_type, i32_t> || std::is_same_v<scalar_type, u32_t>) && total == 1),
+                      "unsupported atomic_add (scalar_type, vec) combination");
+#if defined(__HIP_DEVICE_COMPILE__)
+        if constexpr (std::is_same_v<scalar_type, fp32_t> && total == 1) {
+            static_assert(OPUS_HAS_BUFFER_ATOMIC_FADD_F32, "buffer_atomic_add f32 not supported on this arch");
+#if OPUS_HAS_BUFFER_ATOMIC_FADD_F32
+#if OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN
+            return __builtin_bit_cast(type, __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_f32(__builtin_bit_cast(fp32_t, x), cached_rsrc, vo, s_os, aux));
+#else
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_fadd_f32(__builtin_bit_cast(fp32_t, x), rsrc_, vo, s_os, aux));
+#endif
+#endif
+        } else if constexpr (std::is_same_v<scalar_type, fp16_t> && total == 2) {
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16
+#if OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
+            return __builtin_bit_cast(type, __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_v2f16(__builtin_bit_cast(fp16x2_t, x), cached_rsrc, vo, s_os, aux));
+#else
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_fadd_v2f16(__builtin_bit_cast(fp16x2_t, x), rsrc_, vo, s_os, aux));
+#endif
+#else
+            return __builtin_bit_cast(type, _atomic_pk_add_cas(__builtin_bit_cast(fp16x2_t, x), vo, s_os, aux));
+#endif
+        } else if constexpr (std::is_same_v<scalar_type, bf16_t> && total == 2) {
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(__builtin_bit_cast(bf16x2_t, x), rsrc_, vo, s_os, aux));
+#else
+            return __builtin_bit_cast(type, _atomic_pk_add_cas(__builtin_bit_cast(bf16x2_t, x), vo, s_os, aux));
+#endif
+        } else /* i32/u32 */ {
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_add_i32(__builtin_bit_cast(i32_t, x), rsrc_, vo, s_os, aux));
+        }
+#else
+        (void)vo; (void)s_os; return type{};   // host: never codegen'd, body present only to satisfy parsing
+#endif
     }
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
     OPUS_D auto load(int v_os, int s_os = 0, number<aux> = {}) { return _load<vec>(v_os * sizeof(T), s_os * sizeof(T), number<aux>{}); }
 
-    template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
-    OPUS_D void async_load(void* dst, int v_os, int s_os = 0, number<aux> = {}) { _async_load<vec>(reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<__UINTPTR_TYPE__>(dst)), v_os * sizeof(T), s_os * sizeof(T), number<aux>{}); }
+    template<index_t vec = 1, index_t i_os = 0, index_t aux = 0>   // os in unit of T and cast to vector with vec; i_os = compile-time immediate byte offset (see _async_load notes; applies to both src and dst)
+    OPUS_D void async_load(void* dst, int v_os, int s_os = 0, number<i_os> = {}, number<aux> = {}) { _async_load<vec>(reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<__UINTPTR_TYPE__>(dst)), v_os * sizeof(T), s_os * sizeof(T), number<i_os>{}, number<aux>{}); }
 
     template<index_t vec = 1, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>   // os in unit of T and cast to vector with vec
     OPUS_D void store(const V& x, int v_os, int s_os = 0, number<aux> = {}) {
@@ -1601,27 +2008,52 @@ struct gmem {
         }
     }
 
+    // atomic add. v_os / s_os in unit of T; ioffset is a compile-time element offset folded into the instruction immediate offset: field (also in unit of T). Returns the old value. x must match vec*vector_size.
+    template<index_t vec = 1, index_t ioffset = 0, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>
+    OPUS_D auto atomic_add(const V& x, int v_os, int s_os = 0, number<ioffset> = {}, number<aux> = {}) {
+        static_assert(std::is_same_v<typename vector_traits<V>::dtype, scalar_type>, "scalar type must match for atomic_add");
+        static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check");
+        return _atomic_add<vec, ioffset * static_cast<index_t>(sizeof(T))>(x, v_os * sizeof(T), s_os * sizeof(T), number<ioffset * static_cast<index_t>(sizeof(T))>{}, number<aux>{});
+    }
+
+    // bulk atomic add over a tile layout. value is array/vector of partials, one vec per issue.
+    template<index_t vec = 1, typename V, typename Layout, index_t aux = 0, std::enable_if_t<((is_array_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
+    OPUS_D void atomic_add(const V& x, const Layout& u, int s_os = 0, number<aux> = {})
+    {
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
+#if OPUS_TILE_CONTAINER == 0
+        auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
+                         else if constexpr (is_vector_v<V>) return x; }();
+#elif OPUS_TILE_CONTAINER == 1
+        auto a_ = to_array(x);
+#endif
+        for (index_t i = 0; i < r_elem.value; i++) {
+            vector_type<vec> v_;
+            for (index_t j = 0; j < vec * vector_size; j++) v_[j] = a_[i * vec * vector_size + j];
+            atomic_add<vec>(v_, offsets[i], s_os, number<0>{}, number<aux>{});   // offsets are in element units
+        }
+    }
+
     // bulk load API, give me a Shape of this tile, will issue multiple load instruction based on the y-shape space
     template<index_t vec = 1, typename Layout, index_t aux = 0, std::enable_if_t<is_layout_v<Layout>, bool> = true>
     OPUS_D auto load(const Layout& u, int s_os = 0/* do we really need this? */, number<aux> = {})
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
 #if OPUS_TILE_CONTAINER == 0
-        constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
-        vector_t<scalar_type, vec * vector_size * r_elem.value> r;          // local scratch to host the loaded register, and return it
-        static_ford(issue_space_vec, [&](auto ... ids){
-            auto tmp = load<vec>(u(ids...), s_os, number<aux>{});
-            constexpr index_t u_rs = u_r(ids...);
-            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
-        });
+        vector_t<scalar_type, vec * vector_size * r_elem.value> r;
+        for (index_t i = 0; i < r_elem.value; i++) {
+            auto tmp = load<vec>(offsets[i], s_os, number<aux>{});
+            for (index_t j = 0; j < vec * vector_size; j++) r[i * vec * vector_size + j] = tmp[j];
+        }
         return r;
 #elif OPUS_TILE_CONTAINER == 1
-        constexpr auto u_r = make_layout<-1>(issue_space_vec);                      // we use this layout to describe the register layout
-        array<vector_type<vec>, r_elem.value> r;                                      // local scratch to host the loaded register, and return it
-        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = load<vec>(u(ids...), s_os, number<aux>{}); }); // issue the loading instruction multiple times
+        array<vector_type<vec>, r_elem.value> r;
+        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i], s_os, number<aux>{});
         return r;
 #endif
     }
@@ -1629,53 +2061,57 @@ struct gmem {
     template<index_t vec = 1, typename V, typename Layout, index_t aux = 0, std::enable_if_t<((is_array_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
     OPUS_D void store(const V& x, const Layout& u, int s_os = 0/* do we really need this? */, number<aux> = {})
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
-        constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
 #if OPUS_TILE_CONTAINER == 0
         auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
-                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
+                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<r_elem.value>{});
                          else if constexpr (is_vector_v<V>) return x; }();
 #elif OPUS_TILE_CONTAINER == 1
         auto a_ = to_array(x);
 #endif
-        static_ford(issue_space_vec, [&](auto ... ids){ // issue the loading instruction multiple times
-            auto v_ = slice(a_, number<u_r(ids...)>{}, number<u_r(ids...) + vec>{});
-            store<vec>(v_, u(ids...), s_os, number<aux>{});
-        });
+        for (index_t i = 0; i < r_elem.value; i++) {
+            vector_type<vec> v_;
+            for (index_t j = 0; j < vec * vector_size; j++) v_[j] = a_[i * vec * vector_size + j];
+            store<vec>(v_, offsets[i], s_os, number<aux>{});
+        }
     }
 
-    template<index_t vec = 1, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
-    OPUS_D void async_load(void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
-        constexpr auto issue_space = layout_to_issue_space<LayoutG>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+    template<index_t vec = 1, typename LayoutG, typename LayoutS, index_t i_os = 0, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
+    OPUS_D void async_load(void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<i_os> = {}, number<aux> = {}) {
+        using LT = layout_load_traits<LayoutG, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto gmem_offsets = layout_to_offsets<vec>(u_gmem);
+        auto smem_offsets = layout_to_offsets<vec>(u_smem);
         auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_base));
-        static_ford(issue_space_vec, [&](auto... ids) {
-            async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + u_smem(ids...))), u_gmem(ids...), s_os, number<aux>{});
-        });
+        for (index_t i = 0; i < r_elem.value; i++) {
+            async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[i])), gmem_offsets[i], s_os, number<i_os>{}, number<aux>{});
+        }
     }
 
     template<index_t vec = 1, typename Predicate, typename Layout, index_t aux = 0, std::enable_if_t<is_layout_v<Layout>, bool> = true>
     OPUS_D auto load_if(const Predicate& pred, const Layout& u, int s_os = 0, number<aux> = {})
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto issue_space = LT::issue_space;
+        constexpr auto issue_space_vec = LT::issue_space_vec;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);
 
 #if OPUS_TILE_CONTAINER == 0
-        constexpr auto u_r = make_layout<-1>(issue_space);
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
         static_ford(issue_space_vec, [&](auto ... ids){
-            auto tmp = pred(ids...) ? load<vec>(u(ids...), s_os, number<aux>{}) : vector_type<vec>{0};
-            constexpr index_t u_rs = u_r(ids...);
-            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
+            constexpr index_t idx = u_r(ids...);
+            auto tmp = pred(ids...) ? load<vec>(offsets[idx], s_os, number<aux>{}) : vector_type<vec>{0};
+            set_slice(r, tmp, number<idx * vec>{}, number<(idx + 1) * vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
-        constexpr auto u_r = make_layout<-1>(issue_space_vec);
         array<vector_type<vec>, r_elem.value> r;
-        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? load<vec>(u(ids...), s_os, number<aux>{}) : vector_type<vec>{0}; }); // issue the loading instruction multiple times
+        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? load<vec>(offsets[u_r(ids...)], s_os, number<aux>{}) : vector_type<vec>{0}; });
         return r;
 #endif
     }
@@ -1683,10 +2119,12 @@ struct gmem {
     template<index_t vec = 1, typename Predicate, typename V, typename Layout, index_t aux = 0, std::enable_if_t<((is_array_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
     OPUS_D void store_if(const Predicate& pred, const V& x, const Layout& u, int s_os = 0, number<aux> = {})
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto issue_space = LT::issue_space;
+        constexpr auto issue_space_vec = LT::issue_space_vec;
+        auto offsets = layout_to_offsets<vec>(u);
         constexpr auto u_r = make_layout<-1>(issue_space);
+
 #if OPUS_TILE_CONTAINER == 0
         auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
                          else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
@@ -1696,25 +2134,30 @@ struct gmem {
 #endif
         static_ford(issue_space_vec, [&](auto ... ids){
             if (pred(ids...)) {
-                auto v_ = slice(a_, number<u_r(ids...)>{}, number<u_r(ids...) + vec>{});
-                store<vec>(v_, u(ids...), s_os, number<aux>{});
+                constexpr index_t idx = u_r(ids...);
+                auto v_ = slice(a_, number<idx>{}, number<idx + vec>{});
+                store<vec>(v_, offsets[make_layout<-1>(issue_space_vec)(ids...)], s_os, number<aux>{});
             }
         });
     }
 
-    template<index_t vec = 1, typename Predicate, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
-    OPUS_D void async_load_if(const Predicate& pred, void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
-        constexpr auto issue_space = layout_to_issue_space<LayoutG>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+    template<index_t vec = 1, typename Predicate, typename LayoutG, typename LayoutS, index_t i_os = 0, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
+    OPUS_D void async_load_if(const Predicate& pred, void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<i_os> = {}, number<aux> = {}) {
+        using LT = layout_load_traits<LayoutG, vec>;
+        constexpr auto issue_space_vec = LT::issue_space_vec;
+        auto gmem_offsets = layout_to_offsets<vec>(u_gmem);
+        auto smem_offsets = layout_to_offsets<vec>(u_smem);
         auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_base));
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);
 
         static_ford(issue_space_vec, [&](auto... ids) {
+            constexpr index_t idx = u_r(ids...);
             if (pred(ids...)) {
-                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + u_smem(ids...))), u_gmem(ids...), s_os, number<aux>{});
+                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[idx])), gmem_offsets[idx], s_os, number<i_os>{}, number<aux>{});
             } else {
                 using type = vector_type<vec>;
                 type z = {0};
-                *reinterpret_cast<OPUS_LDS_ADDR type*>(smem_ptr + u_smem(ids...)) = z;
+                *reinterpret_cast<OPUS_LDS_ADDR type*>(smem_ptr + smem_offsets[idx]) = z;
             }
         });
     }
@@ -1727,7 +2170,7 @@ struct gmem {
 
 template<typename T_> OPUS_D decltype(auto) make_gmem(const T_* ptr, unsigned int size = 0xffffffff, unsigned int config = buffer_default_config()) { return gmem<T_>{ptr, size, config}; }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// smem load/store related. TODO: tr_load
+// smem load/store related
 template<typename T_>
 struct smem {
     using T = remove_cvref_t<T_>;
@@ -1739,6 +2182,26 @@ struct smem {
 
     template<index_t vec = 1> OPUS_D auto _load(int v_os/* in unit of byte*/) { using type = vector_type<vec>; return *reinterpret_cast<OPUS_LDS_ADDR type*>(ptr + v_os); }
 
+    template<index_t vec = 1, int imm_offset = 0> OPUS_D auto _tr_load(int v_os/* in unit of byte*/) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+        using type = vector_type<vec>;
+        static_assert(sizeof(type) == 8, "DS_READ_B64_TR requires 8-byte (64-bit) load");
+        constexpr index_t elem_bits = sizeof_bits_v<scalar_type>;
+        i32x2_t raw;
+        const u32_t addr = static_cast<u32_t>(reinterpret_cast<__UINTPTR_TYPE__>(ptr + v_os));
+        if      constexpr (elem_bits == 16) { asm volatile("ds_read_b64_tr_b16 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
+        else if constexpr (elem_bits == 8)  { asm volatile("ds_read_b64_tr_b8 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
+        else if constexpr (elem_bits == 4)  { asm volatile("ds_read_b64_tr_b4 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
+        else { static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar type"); }
+        return __builtin_bit_cast(type, raw);
+#elif defined(__HIP_DEVICE_COMPILE__)
+        static_assert(sizeof(T_) == 0, "smem::_tr_load requires __gfx950__");
+        return _load<vec>(v_os + imm_offset);
+#else
+        return _load<vec>(v_os + imm_offset);
+#endif
+    }
+
     template<index_t vec = 1, typename V>
     OPUS_D void _store(const V& x, int v_os/* in unit of byte*/) {
         static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check");
@@ -1747,6 +2210,8 @@ struct smem {
     }
 
     template<index_t vec = 1> OPUS_D auto load(int v_os) { return _load<vec>(v_os * sizeof(T)); }
+
+    template<index_t vec = 1> OPUS_D auto tr_load(int v_os) { return _tr_load<vec>(v_os * sizeof(T)); }
 
     template<index_t vec = 1, typename V, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>
     OPUS_D void store(const V& x, int v_os) {
@@ -1763,23 +2228,54 @@ struct smem {
     template<index_t vec = 1, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
     OPUS_D auto load(const Layout& u)
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
 #if OPUS_TILE_CONTAINER == 0
-        constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
-        vector_t<scalar_type, vec * vector_size * r_elem.value> r;          // local scratch to host the loaded register, and return it
-        static_ford(issue_space_vec, [&](auto ... ids){
-            auto tmp = load<vec>(u(ids...));
-            constexpr index_t u_rs = u_r(ids...);
-            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
+        vector_t<scalar_type, vec * vector_size * r_elem.value> r;
+        for (index_t i = 0; i < r_elem.value; i++) {
+            auto tmp = load<vec>(offsets[i]);
+            for (index_t j = 0; j < vec * vector_size; j++) r[i * vec * vector_size + j] = tmp[j];
+        }
+        return r;
+#elif OPUS_TILE_CONTAINER == 1
+        array<vector_type<vec>, r_elem.value> r;
+        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i]);
+        return r;
+#endif
+    }
+
+    template<index_t vec = 1, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
+    OPUS_D auto tr_load(const Layout& u)
+    {
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        constexpr bool is_static_layout = is_static_tuple_v<typename Layout::Shape> && is_static_tuple_v<typename Layout::Stride>;
+        [[maybe_unused]] auto offsets = layout_to_offsets<vec>(u);
+
+        auto issue = [&](auto i) {
+            if constexpr (is_static_layout) {
+                using shift = layout_shift_traits<remove_cvref_t<Layout>>;
+                constexpr int off = layout_imm_offsets_v<Layout, vec>[i.value] * sizeof(T);
+                if constexpr (off >= 0 && off <= 0xffff) {
+                    const auto& ub = static_cast<const typename shift::base&>(u);
+                    const int base = ub(make_repeated_tuple(number<0>{}, number<size<decltype(LT::issue_space_vec)>()>{})) * sizeof(T);
+                    return _tr_load<vec, off>(base);
+                }
+            }
+            return tr_load<vec>(offsets[i.value]);
+        };
+
+#if OPUS_TILE_CONTAINER == 0
+        vector_t<scalar_type, vec * vector_size * r_elem.value> r;
+        static_for<r_elem.value>([&](auto i){
+            set_slice(r, issue(i), number<i.value * vec>{}, number<(i.value + 1) * vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
-        constexpr auto u_r = make_layout<-1>(issue_space_vec);                      // we use this layout to describe the register layout
-        array<vector_type<vec>, r_elem.value> r;                                      // local scratch to host the loaded register, and return it
-        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = load<vec>(u(ids...)); }); // issue the loading instruction multiple times
+        array<vector_type<vec>, r_elem.value> r;
+        static_for<r_elem.value>([&](auto i){ r[i.value] = issue(i); });
         return r;
 #endif
     }
@@ -1787,43 +2283,82 @@ struct smem {
     template<index_t vec = 1, typename V, typename Layout, std::enable_if_t<((is_array_v<V> || is_dtype_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
     OPUS_D void store(const V& x, const Layout& u)
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
-        constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
 #if OPUS_TILE_CONTAINER == 0
         auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
-                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
+                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<r_elem.value>{});
                          else if constexpr (is_vector_v<V>) return x; }();
 #elif OPUS_TILE_CONTAINER == 1
         auto a_ = to_array(x);
 #endif
-        static_ford(issue_space_vec, [&](auto ... ids){ // issue the loading instruction multiple times
-            auto v_ = slice(a_, number<u_r(ids...)>{}, number<u_r(ids...) + vec>{});
-            store<vec>(v_, u(ids...));
-        });
+        for (index_t i = 0; i < r_elem.value; i++) {
+            vector_type<vec> v_;
+            for (index_t j = 0; j < vec * vector_size; j++) v_[j] = a_[i * vec * vector_size + j];
+            store<vec>(v_, offsets[i]);
+        }
     }
 
     template<index_t vec = 1, typename Predicate, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
     OPUS_D auto load_if(const Predicate& pred, const Layout& u)
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto issue_space_vec = LT::issue_space_vec;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);
 
 #if OPUS_TILE_CONTAINER == 0
-        constexpr auto u_r = make_layout<-1>(issue_space);
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
         static_ford(issue_space_vec, [&](auto ... ids){
-            auto tmp = pred(ids...) ? load<vec>(u(ids...)) : vector_type<vec>{0};
-            constexpr index_t u_rs = u_r(ids...);
-            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
+            constexpr index_t idx = u_r(ids...);
+            auto tmp = pred(ids...) ? load<vec>(offsets[idx]) : vector_type<vec>{0};
+            set_slice(r, tmp, number<idx * vec>{}, number<(idx + 1) * vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
-        constexpr auto u_r = make_layout<-1>(issue_space_vec);
         array<vector_type<vec>, r_elem.value> r;
-        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? load<vec>(u(ids...)) : vector_type<vec>{0}; });
+        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? load<vec>(offsets[u_r(ids...)]) : vector_type<vec>{0}; });
+        return r;
+#endif
+    }
+
+    template<index_t vec = 1, typename Predicate, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
+    OPUS_D auto tr_load_if(const Predicate& pred, const Layout& u)
+    {
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto issue_space_vec = LT::issue_space_vec;
+        constexpr auto r_elem = LT::r_elem;
+        constexpr bool is_static_layout = is_static_tuple_v<typename Layout::Shape> && is_static_tuple_v<typename Layout::Stride>;
+        [[maybe_unused]] auto offsets = layout_to_offsets<vec>(u);
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);
+
+        auto issue = [&](auto i) {
+            if constexpr (is_static_layout) {
+                using shift = layout_shift_traits<remove_cvref_t<Layout>>;
+                constexpr int off = layout_imm_offsets_v<Layout, vec>[i.value] * sizeof(T);
+                if constexpr (off >= 0 && off <= 0xffff) {
+                    const auto& ub = static_cast<const typename shift::base&>(u);
+                    const int base = ub(make_repeated_tuple(number<0>{}, number<size<decltype(LT::issue_space_vec)>()>{})) * sizeof(T);
+                    return _tr_load<vec, off>(base);
+                }
+            }
+            return tr_load<vec>(offsets[i.value]);
+        };
+
+#if OPUS_TILE_CONTAINER == 0
+        vector_t<scalar_type, vec * vector_size * r_elem.value> r;
+        static_ford(issue_space_vec, [&](auto ... ids){
+            constexpr index_t idx = u_r(ids...);
+            auto tmp = pred(ids...) ? issue(number<idx>{}) : vector_type<vec>{0};
+            set_slice(r, tmp, number<idx * vec>{}, number<(idx + 1) * vec>{});
+        });
+        return r;
+#elif OPUS_TILE_CONTAINER == 1
+        array<vector_type<vec>, r_elem.value> r;
+        static_ford(issue_space_vec, [&](auto ... ids){ constexpr index_t idx = u_r(ids...); r[idx] = pred(ids...) ? issue(number<idx>{}) : vector_type<vec>{0}; });
         return r;
 #endif
     }
@@ -1831,10 +2366,12 @@ struct smem {
     template<index_t vec = 1, typename Predicate, typename V, typename Layout, std::enable_if_t<((is_array_v<V> || is_dtype_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
     OPUS_D void store_if(const Predicate& pred, const V& x, const Layout& u)
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto issue_space = LT::issue_space;
+        constexpr auto issue_space_vec = LT::issue_space_vec;
+        auto offsets = layout_to_offsets<vec>(u);
         constexpr auto u_r = make_layout<-1>(issue_space);
+
 #if OPUS_TILE_CONTAINER == 0
         auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
                          else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
@@ -1844,8 +2381,9 @@ struct smem {
 #endif
         static_ford(issue_space_vec, [&](auto ... ids){
             if (pred(ids...)) {
-                auto v_ = slice(a_, number<u_r(ids...)>{}, number<u_r(ids...) + vec>{});
-                store<vec>(v_, u(ids...));
+                constexpr index_t idx = u_r(ids...);
+                auto v_ = slice(a_, number<idx>{}, number<idx + vec>{});
+                store<vec>(v_, offsets[make_layout<-1>(issue_space_vec)(ids...)]);
             }
         });
     }
@@ -1854,6 +2392,211 @@ struct smem {
 };
 
 template<typename T_> OPUS_D decltype(auto) make_smem(T_* ptr) { return smem<T_>{ptr}; }
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// tdm (gfx1250): tdm_desc = stateless D# (sg0..sg3 raw dwords); tdm_window = stateful tile window with make() + move(d0..d4, lds) + load_to_lds<cpol>(); cpol[6:0] = | rsvd | NV | scope[2] | th[3] |.
+// __builtin_amdgcn_tensor_load_to_lds only exists on clang>=22 (ROCm>=7.2); gate the host pass too so clang-20 (ROCm 7.1) CI does not parse it.
+#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+
+enum class tdm_load_th : u8_t { rt=0, nt=1, ht=2, bypass=3, nt_rt=4, rt_nt=5, nt_ht=6 };           // bypass = LU (last-use)
+enum class tdm_scope   : u8_t { cu=0, se=1, dev=2, sys=3 };
+
+OPUS_H_D constexpr int make_cpol(tdm_load_th th = tdm_load_th::rt, tdm_scope sc = tdm_scope::dev, bool nv = false) { return (int(th) & 0x7) | ((int(sc) & 0x3) << 3) | (nv ? (1 << 5) : 0); }
+inline constexpr int default_cpol = make_cpol(tdm_load_th::rt, tdm_scope::dev);                     // = 16
+static_assert(default_cpol == 16, "cpol layout drift");
+
+namespace impl {
+template<typename T> struct is_static_zero : false_type {};
+template<index_t I>  struct is_static_zero<number<I>> : bool_constant<I == 0> {};
+template<typename T> static constexpr bool is_static_zero_v = is_static_zero<remove_cvref_t<T>>::value;
+
+template<bool En> struct tdm_dim_state {};
+template<>        struct tdm_dim_state<true> { u32_t extent=0; u64_t stride=0; u32_t origin=0; };
+
+// saturating_sub via pure SALU (s_sub_co_u32 + s_cselect_b32); clamps underflow to 0.
+OPUS_H_D u32_t tdm_saturating_sub(u32_t e, u32_t o) {
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__AMDGCN__)
+    u32_t es = __builtin_amdgcn_readfirstlane(e), os = __builtin_amdgcn_readfirstlane(o), r;
+    asm("s_sub_co_u32 %0, %1, %2\n\ts_cselect_b32 %0, 0, %0" : "=s"(r) : "s"(es), "s"(os) : "scc"); return r;
+#else
+    return (o < e) ? (e - o) : 0u;
+#endif
+}
+
+// wg_mask: seq<i0, i1, ...> index i → bit i. WgCount=0 → mask=0 (no multicast).
+template<index_t WgCount, typename Wgs> struct tdm_wg_mask;
+template<index_t WgCount, index_t... Is> struct tdm_wg_mask<WgCount, seq<Is...>> {
+    static_assert(WgCount >= 0 && (WgCount == 0 || index_t(sizeof...(Is)) == WgCount) && (WgCount == 0 || (((Is >= 0) && ...) && ((Is < 16) && ...))), "tdm_desc: bad selected workgroups");
+    static constexpr u16_t value = [] { if constexpr (WgCount == 0) return u16_t(0); else return (u16_t(0) | ... | u16_t(u16_t(1) << Is)); }();
+};
+template<index_t WgCount, typename Wgs> static constexpr u16_t tdm_wg_mask_v = tdm_wg_mask<WgCount, Wgs>::value;
+
+// __builtin_amdgcn_tensor_load_to_lds operand types (6th arg sg_extra MUST be present & all-zero).
+using tdm_sg0_vec      = i32_t __attribute__((ext_vector_type(4)));
+using tdm_sg1_vec      = i32_t __attribute__((ext_vector_type(8)));
+using tdm_sg2_vec      = i32_t __attribute__((ext_vector_type(4)));
+using tdm_sg3_vec      = i32_t __attribute__((ext_vector_type(4)));
+using tdm_sg_extra_vec = i32_t __attribute__((ext_vector_type(8)));
+} // namespace impl
+
+template<typename T> struct tdm_data_size { static_assert(sizeof(T)==1||sizeof(T)==2||sizeof(T)==4||sizeof(T)==8, "tdm_data_size: bad element size"); static constexpr u64_t value = (sizeof(T)==1)?0:(sizeof(T)==2)?1:(sizeof(T)==4)?2:3; };
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// tdm_desc<T, TileDim0..4, flags, pad, SelectedWgs>: stateless D# (sg0..sg3 raw u32_t arrays); compile-time defaults baked into the storage initializer, runtime setters are hand-coded mask+or.
+template<typename DataType,
+         u64_t TileDim0=0, u64_t TileDim1=0, u64_t TileDim2=0, u64_t TileDim3=0, u64_t TileDim4=0,
+         u64_t Count=1, u64_t GatherIndexSize=0, u64_t GatherMode=0, u64_t TypeLo=0, u64_t TypeHi=1,
+         u64_t AtomicBarrierEn=0, u64_t IterateEn=0, u64_t McEarlyTimeout=0, index_t SelectedWorkgroupCount=0,
+         u64_t LdsPadEn=0, u64_t PadInterval=0, u64_t PadAmount=0, typename SelectedWorkgroups = seq<>>
+struct tdm_desc {
+    static constexpr u64_t data_size = tdm_data_size<DataType>::value;
+    static constexpr u64_t wg_mask   = impl::tdm_wg_mask_v<SelectedWorkgroupCount, SelectedWorkgroups>;
+    static constexpr u32_t ndim      = (TileDim4!=0)?5:(TileDim3!=0)?4:(TileDim2!=0)?3:2;
+
+    // Compile-time dword inits (only slots holding ≥1 compile-time field):
+    static constexpr u32_t sg0_init0 = u32_t(Count & 0x1) | (u32_t(GatherIndexSize & 0x1) << 30) | (u32_t(GatherMode & 0x1) << 31);                                            // count | gather flags
+    static constexpr u32_t sg0_init3 = (u32_t(TypeLo & 0x1) << 30) | (u32_t(TypeHi & 0x1) << 31);                                                                                  // global_addr_hi(rt) | type
+    static constexpr u32_t sg1_init0 = u32_t(wg_mask & 0xFFFF) | (u32_t(data_size & 0x3) << 16) | (u32_t(AtomicBarrierEn & 0x1) << 18) | (u32_t(IterateEn & 0x1) << 19) | (u32_t(LdsPadEn & 0x1) << 20) | (u32_t(McEarlyTimeout & 0x1) << 21) | (u32_t(PadInterval & 0x7) << 22) | (u32_t(PadAmount & 0x7F) << 25);   // wg_mask | data_size | flags | pad
+    static constexpr u32_t sg1_init3 = u32_t(TileDim0 & 0xFFFF) << 16;                                                                                                                // tensor_dim1_lo(rt) | tile_dim0
+    static constexpr u32_t sg1_init4 = u32_t(TileDim1 & 0xFFFF) | (u32_t(TileDim2 & 0xFFFF) << 16);                                                                                // tile_dim1 | tile_dim2
+    static constexpr u32_t sg2_init3 = u32_t(TileDim3 & 0xFFFF) << 16;                                                                                                                // tdim2_stride_hi(rt) | tile_dim3
+    static constexpr u32_t sg3_init2 = u32_t(TileDim4 & 0xFFFF) << 16;                                                                                                                // tensor_dim4_hi(rt) | tile_dim4
+
+    u32_t sg0[4]{ sg0_init0, 0, 0, sg0_init3 };
+    u32_t sg1[8]{ sg1_init0, 0, 0, sg1_init3, sg1_init4, 0, 0, 0 };
+    u32_t sg2[4]{ 0, 0, 0, sg2_init3 };
+    u32_t sg3[4]{ 0, 0, sg3_init2, 0 };
+
+    // Runtime setters (bit positions as comments):
+    OPUS_H_D void set_lds_addr          (u32_t v) { sg0[1] = v; }                                                                                                              // [32:32] (LDS addr is 32-bit on gfx1250)
+    OPUS_H_D void set_global_addr       (u64_t v) { sg0[2] = u32_t(v); sg0[3] = (sg0[3] & 0xFE000000u) | u32_t((v >> 32) & 0x01FFFFFFu); }                                  // [64:57]
+    OPUS_H_D void set_tensor_dim0       (u32_t  v) { sg1[1] = (sg1[1] & 0x0000FFFFu) | (v << 16); sg1[2] = (sg1[2] & 0xFFFF0000u) | (v >> 16); }                        // [48:32]
+    OPUS_H_D void set_tensor_dim1       (u32_t  v) { sg1[2] = (sg1[2] & 0x0000FFFFu) | (v << 16); sg1[3] = (sg1[3] & 0xFFFF0000u) | (v >> 16); }                        // [80:32]
+    OPUS_H_D void set_lds_barrier_addr  (u16_t  v) { sg1[1] = (sg1[1] & 0xFFFF0000u) | u32_t(v); }                                                                   // [32:16]
+    OPUS_H_D void set_tensor_dim0_stride(u64_t  v) { sg1[5] = u32_t(v); sg1[6] = (sg1[6] & 0xFFFF0000u) | u32_t((v >> 32) & 0xFFFFu); }                           // [160:48]
+    OPUS_H_D void set_tensor_dim1_stride(u64_t  v) { sg1[6] = (sg1[6] & 0x0000FFFFu) | u32_t((v & 0xFFFFu) << 16); sg1[7] = u32_t(v >> 16); }                     // [208:48]
+    OPUS_H_D void set_tensor_dim2       (u32_t  v) { sg2[0] = v; }                                                                                                      // [0:32]
+    OPUS_H_D void set_tensor_dim3       (u32_t  v) { sg2[1] = v; }                                                                                                      // [32:32]
+    OPUS_H_D void set_tensor_dim2_stride(u64_t  v) { sg2[2] = u32_t(v); sg2[3] = (sg2[3] & 0xFFFF0000u) | u32_t((v >> 32) & 0xFFFFu); }                           // [64:48]
+    OPUS_H_D void set_tensor_dim3_stride(u64_t  v) { sg3[0] = u32_t(v); sg3[1] = (sg3[1] & 0xFFFF0000u) | u32_t((v >> 32) & 0xFFFFu); }                           // [0:48]
+    OPUS_H_D void set_tensor_dim4       (u32_t  v) { sg3[1] = (sg3[1] & 0x0000FFFFu) | (v << 16); sg3[2] = (sg3[2] & 0xFFFF0000u) | (v >> 16); }                        // [48:32]
+    // CLUSTER_LOAD_ASYNC peer bitmask (sg1[0] [15:0]); a <=1-WG mask has no fan-out so store 0 (multicast off).   // [0:16]
+    OPUS_H_D void set_workgroup_mask    (u16_t  v) { u16_t m = (__builtin_popcount((unsigned)v) > 1) ? v : u16_t(0); sg1[0] = (sg1[0] & 0xFFFF0000u) | u32_t(m); }
+
+    OPUS_H_D void make(u32_t lds_addr, const void* global_addr, u32_t td0, u32_t td1, u64_t s0,
+                       u64_t s1=0, u16_t lds_bar=0, u32_t td2=0, u32_t td3=0, u64_t s2=0, u64_t s3=0, u32_t td4=0) {
+        set_lds_addr(lds_addr); set_global_addr(reinterpret_cast<u64_t>(global_addr));
+        set_tensor_dim0(td0); set_tensor_dim1(td1); set_tensor_dim0_stride(s0);
+        if (lds_bar) set_lds_barrier_addr(lds_bar);
+        if (s1)  set_tensor_dim1_stride(s1);
+        if (td2) set_tensor_dim2(td2); if (td3) set_tensor_dim3(td3); if (s2) set_tensor_dim2_stride(s2);
+        if (s3)  set_tensor_dim3_stride(s3); if (td4) set_tensor_dim4(td4);
+    }
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// tdm_window<T, ...>: stateful tile window over tdm_desc; caches global/lds_offset_bytes (layout_linear), move(d0..d4, lds) does cache += delta and rewrites only affected fields, opus::number<0>{} (0_I) elides that slot at compile time.
+template<typename DataType,
+         u64_t TileDim0=0, u64_t TileDim1=0, u64_t TileDim2=0, u64_t TileDim3=0, u64_t TileDim4=0,
+         u64_t Count=1, u64_t GatherIndexSize=0, u64_t GatherMode=0, u64_t TypeLo=0, u64_t TypeHi=1,
+         u64_t AtomicBarrierEn=0, u64_t IterateEn=0, u64_t McEarlyTimeout=0, index_t SelectedWorkgroupCount=0,
+         u64_t LdsPadEn=0, u64_t PadInterval=0, u64_t PadAmount=0, typename SelectedWorkgroups = seq<>,
+         int CachePol = default_cpol>
+struct tdm_window {
+    using desc_t = tdm_desc<DataType, TileDim0, TileDim1, TileDim2, TileDim3, TileDim4, Count, GatherIndexSize, GatherMode, TypeLo, TypeHi, AtomicBarrierEn, IterateEn, McEarlyTimeout, SelectedWorkgroupCount, LdsPadEn, PadInterval, PadAmount, SelectedWorkgroups>;
+
+    static constexpr int      cache_pol = CachePol;
+    static constexpr u32_t ndim      = desc_t::ndim;
+    static constexpr bool     has_dim2  = (ndim >= 3), has_dim3 = (ndim >= 4), has_dim4 = (ndim >= 5);
+    static_assert((CachePol & ~0x3F) == 0, "tdm_window: cache_pol must fit in 6 bits");
+
+    desc_t    desc{};
+    u32_t            lds_base_addr=0, lds_offset_bytes=0;                                            // LDS addr/offset are 32-bit on gfx1250
+    u64_t            global_base_addr=0, global_offset_bytes=0;
+    u32_t  extent0=0, extent1=0, origin0=0, origin1=0;
+    u64_t  stride0=0;                                                                                // = tdm tensor_dim0_stride (elements)
+    [[no_unique_address]] impl::tdm_dim_state<has_dim2> dim2{};
+    [[no_unique_address]] impl::tdm_dim_state<has_dim3> dim3{};
+    [[no_unique_address]] impl::tdm_dim_state<has_dim4> dim4{};
+
+    // 2D make; 3D/4D/5D SFINAE overloads omitted (uncommon).
+    OPUS_H_D void make(u32_t lds_base, const void* global_base, u32_t lds_off, u32_t td0, u32_t td1, u64_t s0, u32_t o0=0, u32_t o1=0) {
+        lds_base_addr=lds_base; global_base_addr=reinterpret_cast<u64_t>(global_base);
+        lds_offset_bytes=lds_off; stride0=s0; origin0=o0; origin1=o1;
+        extent0=o0+td0; extent1=o1+td1; materialize_desc_initial();
+    }
+
+    // 6-operand tensor_load_to_lds (clang>=23 / ROCm>=7.14) vs 5-operand (older); auto-detected from clang version, predefine OPUS_TDM_BUILTIN_HAS_SG_EXTRA=0/1 to override.
+#ifndef OPUS_TDM_BUILTIN_HAS_SG_EXTRA
+#  if defined(__clang_major__) && (__clang_major__ >= 23)
+#    define OPUS_TDM_BUILTIN_HAS_SG_EXTRA 1
+#  else
+#    define OPUS_TDM_BUILTIN_HAS_SG_EXTRA 0
+#  endif
+#endif
+#if OPUS_TDM_BUILTIN_HAS_SG_EXTRA
+#define OPUS_TDM_SG_EXTRA_ARG , impl::tdm_sg_extra_vec{0, 0, 0, 0, 0, 0, 0, 0}
+#else
+#define OPUS_TDM_SG_EXTRA_ARG
+#endif
+
+    template<int cpol = cache_pol>
+    OPUS_D void load_to_lds() const {
+        if constexpr (ndim == 2)
+            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tdm_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tdm_sg1_vec, desc.sg1), impl::tdm_sg2_vec{0,0,0,0}, impl::tdm_sg3_vec{0,0,0,0} OPUS_TDM_SG_EXTRA_ARG, cpol);
+        else
+            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tdm_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tdm_sg1_vec, desc.sg1), __builtin_bit_cast(impl::tdm_sg2_vec, desc.sg2), __builtin_bit_cast(impl::tdm_sg3_vec, desc.sg3) OPUS_TDM_SG_EXTRA_ARG, cpol);
+    }
+
+    // move(d0..d4, lds): per-dim signed deltas + lds byte delta. 0_I args are compile-time elided.
+    template<typename D0=number<0>, typename D1=number<0>, typename D2=number<0>, typename D3=number<0>, typename D4=number<0>, typename Lds=number<0>>
+    OPUS_H_D void move(D0 d0={}, D1 d1={}, D2 d2={}, D3 d3={}, D4 d4={}, Lds lds={}) {
+        static_assert(has_dim2 || impl::is_static_zero_v<D2>, "tdm_window::move(): d2 requires has_dim2");
+        static_assert(has_dim3 || impl::is_static_zero_v<D3>, "tdm_window::move(): d3 requires has_dim3");
+        static_assert(has_dim4 || impl::is_static_zero_v<D4>, "tdm_window::move(): d4 requires has_dim4");
+        constexpr bool z0=impl::is_static_zero_v<D0>, z1=impl::is_static_zero_v<D1>, z2=impl::is_static_zero_v<D2>, z3=impl::is_static_zero_v<D3>, z4=impl::is_static_zero_v<D4>, zL=impl::is_static_zero_v<Lds>;
+        if constexpr (!z0)             origin0     = u32_t(i64_t(origin0)     + i64_t(d0));
+        if constexpr (!z1)             origin1     = u32_t(i64_t(origin1)     + i64_t(d1));
+        if constexpr (has_dim2 && !z2) dim2.origin = u32_t(i64_t(dim2.origin) + i64_t(d2));
+        if constexpr (has_dim3 && !z3) dim3.origin = u32_t(i64_t(dim3.origin) + i64_t(d3));
+        if constexpr (has_dim4 && !z4) dim4.origin = u32_t(i64_t(dim4.origin) + i64_t(d4));
+        constexpr bool any_moved = !z0 || !z1 || (has_dim2 && !z2) || (has_dim3 && !z3) || (has_dim4 && !z4);
+        if constexpr (any_moved) { global_offset_bytes = u64_t(i64_t(global_offset_bytes) + coord_delta_to_global_offset_bytes(d0, d1, d2, d3, d4)); desc.set_global_addr(global_base_addr + global_offset_bytes); }
+        if constexpr (!zL)       { lds_offset_bytes    = u32_t(i32_t(lds_offset_bytes) + i32_t(lds)); desc.sg0[1] = lds_base_addr + lds_offset_bytes; }   // lds_addr direct dword write
+        if constexpr (!z0)             desc.set_tensor_dim0(impl::tdm_saturating_sub(extent0,     origin0));
+        if constexpr (!z1)             desc.set_tensor_dim1(impl::tdm_saturating_sub(extent1,     origin1));
+        if constexpr (has_dim2 && !z2) desc.set_tensor_dim2(impl::tdm_saturating_sub(dim2.extent, dim2.origin));
+        if constexpr (has_dim3 && !z3) desc.set_tensor_dim3(impl::tdm_saturating_sub(dim3.extent, dim3.origin));
+        if constexpr (has_dim4 && !z4) desc.set_tensor_dim4(impl::tdm_saturating_sub(dim4.extent, dim4.origin));
+    }
+private:
+    template<typename D0, typename D1, typename D2, typename D3, typename D4>
+    OPUS_H_D constexpr i64_t coord_delta_to_global_offset_bytes(D0 d0, D1 d1, D2 d2, D3 d3, D4 d4) const {
+        i64_t dg = 0;
+        if constexpr (!impl::is_static_zero_v<D0>)             dg += i64_t(d0) * i64_t(sizeof(DataType));
+        if constexpr (!impl::is_static_zero_v<D1>)             dg += i64_t(d1) * i64_t(stride0)     * i64_t(sizeof(DataType));
+        if constexpr (has_dim2 && !impl::is_static_zero_v<D2>) dg += i64_t(d2) * i64_t(dim2.stride) * i64_t(sizeof(DataType));
+        if constexpr (has_dim3 && !impl::is_static_zero_v<D3>) dg += i64_t(d3) * i64_t(dim3.stride) * i64_t(sizeof(DataType));
+        if constexpr (has_dim4 && !impl::is_static_zero_v<D4>) dg += i64_t(d4) * i64_t(dim4.stride) * i64_t(sizeof(DataType));
+        return dg;
+    }
+    OPUS_H_D void materialize_desc_initial() {
+        u64_t s1=0, s2=0, s3=0; u32_t td2=0, td3=0, td4=0;
+        if constexpr (has_dim2) { s1 = dim2.stride; td2 = dim2.extent; }
+        if constexpr (has_dim3) { s2 = dim3.stride; td3 = dim3.extent; }
+        if constexpr (has_dim4) { s3 = dim4.stride; td4 = dim4.extent; }
+        u64_t off = u64_t(origin0) + u64_t(origin1) * stride0;
+        if constexpr (has_dim2) off += u64_t(dim2.origin) * dim2.stride;
+        if constexpr (has_dim3) off += u64_t(dim3.origin) * dim3.stride;
+        if constexpr (has_dim4) off += u64_t(dim4.origin) * dim4.stride;
+        global_offset_bytes = off * sizeof(DataType);
+        desc.make(lds_base_addr + lds_offset_bytes, reinterpret_cast<const void*>(global_base_addr + global_offset_bytes),
+                  impl::tdm_saturating_sub(extent0, origin0), impl::tdm_saturating_sub(extent1, origin1),
+                  stride0, s1, 0, td2, td3, s2, s3, td4);
+    }
+};
+
+#endif
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // mem type traits & free function wrappers (eliminate .template syntax in dependent context)
@@ -1876,6 +2619,10 @@ OPUS_D void async_load(Mem& mem, Args&&... args) { mem.template async_load<vec>(
 
 template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
 OPUS_D auto load_if(Mem& mem, Args&&... args) { return mem.template load_if<vec>(std::forward<Args>(args)...); }
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_smem_v<Mem>, bool> = true>
+OPUS_D auto tr_load(Mem& mem, Args&&... args) { return mem.template tr_load<vec>(std::forward<Args>(args)...); }
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_smem_v<Mem>, bool> = true>
+OPUS_D auto tr_load_if(Mem& mem, Args&&... args) { return mem.template tr_load_if<vec>(std::forward<Args>(args)...); }
 template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
 OPUS_D void store_if(Mem& mem, Args&&... args) { mem.template store_if<vec>(std::forward<Args>(args)...); }
 template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_gmem_v<Mem>, bool> = true>
@@ -1953,10 +2700,10 @@ template<typename T, index_t N> using mfma_vtype_t = typename impl::mfma_vtype<T
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
     return inst_(__builtin_bit_cast(long, a), __builtin_bit_cast(long, b), c, cbsz, abid, blgp); }
 
-// scaled MFMA (f8f6f4): input always bitcast to i32x8_t (256 bits); uses format codes and runtime scale
+// scaled MFMA (f8f6f4): input bitcast to i32x8_t (256 bits); uses format codes, runtime scale, and 2-bit byte-selectors (scale_op_sel_a/b) into the packed-int32 scale word.
 #define DISPATCH_MFMA_SCALE_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
-    return inst_(__builtin_bit_cast(i32x8_t, a), __builtin_bit_cast(i32x8_t, b), c, fmt_a, fmt_b, 0, scale_a, 0, scale_b); }
+    return inst_(__builtin_bit_cast(i32x8_t, a), __builtin_bit_cast(i32x8_t, b), c, fmt_a, fmt_b, scale_op_sel_a, scale_a, scale_op_sel_b, scale_b); }
 
 // prefer use make_mfma() to create instance, which will return impl::mfma_adaptor_xxx. In this way we can access layout info from the "mma"
 //
@@ -2025,22 +2772,25 @@ struct mfma {
 
     // Scaled MFMA dispatch (gfx950: f8f6f4 with E8M0 block exponent scaling)
     // scale_a, scale_b are runtime E8M0 exponent values; 127 = no scaling (2^0 = 1.0).
-    template<typename VA, typename VB, typename VC>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) -> vtype_c {
-        (void)a; (void)b; (void)c; (void)scale_a; (void)scale_b;
-        if constexpr (false) {}
+    // scale_op_sel_a/b: compile-time 2-bit byte-selectors picking which byte of the packed-int32 scale word feeds this MFMA; 0 = low byte = legacy scalar behavior.
+    template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) -> vtype_c {
+        (void)a; (void)b; (void)c; (void)scale_a; (void)scale_b;  // used by DISPATCH_MFMA_SCALE_; suppress -Wunused-parameter on host
+        if      constexpr (false) {}
 #if defined(__gfx950__)
         else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp8_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp8_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
+        else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp4_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
+        else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp4_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp4_t, fp4_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp4_t, fp4_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
 #endif
         __builtin_unreachable();
     }
 
-    template<typename VA, typename VB>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
-        vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
+    template<typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
     }
 };
 #undef DISPATCH_MFMA_
@@ -2078,8 +2828,8 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
 #endif // __GFX9__ (mfma)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// wmma (gfx1250 / RDNA4, wave32)
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+// wmma (RDNA4 / wave32) -- gfx1250 uses wmma-256b builtins (16x16x{4,32,64,128}); gfx1200/gfx1201 (Navi 44/48) use wmma-128b _w32_gfx12 builtins (16x16x16). Dispatch macros for the two arg-list shapes differ -- gfx12 set is DISPATCH_WMMA_GFX12_*.
+#if defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
 // f16/bf16/f32 builtins: (neg_a, A, neg_b, B, matrix_fmts, C, clamp, neg_c)
 #define DISPATCH_WMMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
@@ -2101,6 +2851,23 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
     return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), \
                  __builtin_bit_cast(vector_t<i32_t, i32_b>, b), \
                  static_cast<short>(0), c, false, false); }
+
+// gfx12 builtins: 3-arg (A, B, C) -- no matrix_fmts/neg_c. ws_ selects _w32/_w64 (same {wm,wn,wk} triple).
+#define DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) \
+    (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_ && warp_size == ws_)
+#define DISPATCH_WMMA_GFX12_F32_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_) \
+    DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { return inst_(a, b, c); }
+#define DISPATCH_WMMA_GFX12_8BIT_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_) /* fp8/bf8: A/B bitcast to i32 */ \
+    DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { \
+    constexpr index_t i32_a = elem_a * static_cast<index_t>(sizeof(dtype_a)) / static_cast<index_t>(sizeof(i32_t)); \
+    constexpr index_t i32_b = elem_b * static_cast<index_t>(sizeof(dtype_b)) / static_cast<index_t>(sizeof(i32_t)); \
+    return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), __builtin_bit_cast(vector_t<i32_t, i32_b>, b), c); }
+#define DISPATCH_WMMA_GFX12_F32_STEP_K_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_k_, inst_) /* chain Nxinst for wider K */ \
+    DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { \
+    constexpr index_t steps = wk_ / inst_k_, e_a = elem_a / steps, e_b = elem_b / steps; \
+    auto tmp = inst_(slice(a, number<0>{}, number<e_a>{}), slice(b, number<0>{}, number<e_b>{}), c); \
+    static_for<steps - 1>([&](auto i){ tmp = inst_(slice(a, number<e_a*(i+1)>{}, number<e_a*(i+2)>{}), slice(b, number<e_b*(i+1)>{}, number<e_b*(i+2)>{}), tmp); }); \
+    return tmp; }
 
 template<typename dtype_a_, typename dtype_b_, typename dtype_c_, index_t wave_m_, index_t wave_n_, index_t wave_k_, index_t warp_size_ = get_warp_size()>
 struct wmma {
@@ -2165,6 +2932,37 @@ struct wmma {
         else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, fp8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_bf8_fp8)
         else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, bf8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_bf8_bf8)
 #endif
+#if defined(__gfx1201__) || defined(__gfx1200__)
+        // _w32/_w64 builtins gated by wavefrontsize target feature; OPUS_GFX120X_IS_WAVE32 selects the active wave mode.
+#  if OPUS_GFX120X_IS_WAVE32
+        // gfx12 wave32 16x16x16: f16/bf16/fp8/bf8 -> f32 + same-type acc. iu8/iu4 deferred.
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp16_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, bf16_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(fp8_t , fp8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(fp8_t , bf8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_fp8_bf8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t , fp8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf8_fp8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t , bf8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12)
+        // gfx12 wave32 16x16x32 synthetic: 2x stacked 16x16x16 along K.
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp32_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, fp32_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp16_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, bf16_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w32_gfx12)
+#  endif // wave32 builtin available
+#  if !OPUS_GFX120X_IS_WAVE32
+        // gfx12 wave64 16x16x16: native _w64_gfx12 builtins (4 elem/lane). Requires -mwavefrontsize64.
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp32_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f32_16x16x16_f16_w64_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, fp32_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp16_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f16_16x16x16_f16_w64_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, bf16_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w64_gfx12)
+        // gfx12 wave64 16x16x32 synthetic: 2x stacked _w64 16x16x16 (8 elem/lane = 1 b128 load).
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp32_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w64_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, fp32_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp16_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w64_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, bf16_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w64_gfx12)
+#  endif // wave64 builtin available
+#endif // __gfx1201__ / __gfx1200__
         __builtin_unreachable();
     }
 
@@ -2175,8 +2973,8 @@ struct wmma {
 
     // Scaled WMMA dispatch (gfx1250: f8f6f4 / f4 with E8M0 block-scale)
     // scale_a, scale_b are per-lane E8M0 exponent values; 127 = no scaling (2^0 = 1.0).
-    // BX32: int — 4 packed E8M0 bytes (byte 0 used with scale_sel=0, scale_fmt=0).
-    // BX16: long — 8 packed E8M0 bytes.
+    // BX32: int -- 4 packed E8M0 bytes (byte 0 used with scale_sel=0, scale_fmt=0).
+    // BX16: long -- 8 packed E8M0 bytes.
     // matrix_a_scale_sel controls OPSEL: 0=scale from lanes 0-15, 1=scale from lanes 16-31.
 
     // BX32 scaled dispatch
@@ -2259,6 +3057,35 @@ struct wmma {
 #undef DISPATCH_WMMA_
 #undef DISPATCH_WMMA_BF16F32_
 #undef DISPATCH_WMMA_8BIT_
+#undef DISPATCH_WMMA_GFX12_MATCH_
+#undef DISPATCH_WMMA_GFX12_F32_
+#undef DISPATCH_WMMA_GFX12_8BIT_
+#undef DISPATCH_WMMA_GFX12_F32_STEP_K_
+
+// gfx12 wave32 16x16x16 aliases (default warp_size). wave64 + synthetic 16x16x32 aliases below.
+using wmma_f32_16x16x16_f16     = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 16>;
+using wmma_f16_16x16x16_f16     = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 16>;
+using wmma_f32_16x16x16_bf16    = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 16>;
+using wmma_bf16_16x16x16_bf16   = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 16>;
+using wmma_f32_16x16x16_fp8_fp8 = wmma<fp8_t , fp8_t , fp32_t, 16, 16, 16>;
+using wmma_f32_16x16x16_fp8_bf8 = wmma<fp8_t , bf8_t , fp32_t, 16, 16, 16>;
+using wmma_f32_16x16x16_bf8_fp8 = wmma<bf8_t , fp8_t , fp32_t, 16, 16, 16>;
+using wmma_f32_16x16x16_bf8_bf8 = wmma<bf8_t , bf8_t , fp32_t, 16, 16, 16>;
+// gfx12 wave32 16x16x32 synthetic (2x 16x16x16).
+using wmma_f32_16x16x32_f16_w32   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32, 32>;
+using wmma_f32_16x16x32_bf16_w32  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 32, 32>;
+using wmma_f16_16x16x32_f16_w32   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 32, 32>;
+using wmma_bf16_16x16x32_bf16_w32 = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 32, 32>;
+// gfx12 wave64 16x16x16 (-mwavefrontsize64).
+using wmma_f32_16x16x16_f16_w64   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 16, 64>;
+using wmma_f32_16x16x16_bf16_w64  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 16, 64>;
+using wmma_f16_16x16x16_f16_w64   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 16, 64>;
+using wmma_bf16_16x16x16_bf16_w64 = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 16, 64>;
+// gfx12 wave64 16x16x32 synthetic (2x 16x16x16_w64).
+using wmma_f32_16x16x32_f16_w64   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32, 64>;
+using wmma_f32_16x16x32_bf16_w64  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 32, 64>;
+using wmma_f16_16x16x32_f16_w64   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 32, 64>;
+using wmma_bf16_16x16x32_bf16_w64 = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 32, 64>;
 
 // f16/bf16 16x16x32
 using wmma_f32_16x16x32_f16   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32>;
@@ -2290,7 +3117,7 @@ using wmma_scale_f32_16x16x128_fp8_fp8 = wmma<fp8_t, fp8_t, fp32_t, 16, 16, 128>
 using wmma_scale_f32_16x16x128_fp4_fp4 = wmma<fp4_t, fp4_t, fp32_t, 16, 16, 128>;
 // Scaled WMMA (dedicated fp4 32x16x128 instruction)
 using wmma_scale_f32_32x16x128_fp4_fp4 = wmma<fp4_t, fp4_t, fp32_t, 32, 16, 128>;
-#endif // __gfx1250__ (wmma)
+#endif // __gfx1250__ / __gfx1201__ / __gfx1200__ (wmma)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // adaptor
@@ -2298,11 +3125,13 @@ struct p_dim {};
 struct y_dim {};
 
 namespace impl{ // utlity function to play with shape
+template<typename FDim, typename Target> static constexpr auto pickup_filter(seq<>) { return seq<>{}; }
+template<typename FDim, typename Target, index_t I0, index_t... Rest> static constexpr auto pickup_filter(seq<I0, Rest...>) {
+    if constexpr (std::is_same_v<remove_cvref_t<decltype(get<I0>(FDim{}))>, remove_cvref_t<Target>>) return concat_seq(seq<I0>{}, pickup_filter<FDim, Target>(seq<Rest...>{}));
+    else return pickup_filter<FDim, Target>(seq<Rest...>{}); }
+template<typename Shape, index_t... Fs> OPUS_D static constexpr auto pickup_shape_apply(seq<Fs...>) { return opus::make_tuple(get<Fs>(Shape{})...); }
 template<typename Shape, typename FDim, typename Target, index_t... Is>
-OPUS_D static constexpr auto pickup_shape_impl(const Shape&, const FDim&, Target, seq<Is...>) {
-    static_assert(size<Shape>() == size<FDim>());
-    return concat_tuple(std::conditional_t< std::is_same_v<decltype(get<Is>(FDim{})), remove_cvref_t<Target>>,  tuple<decltype(get<Is>(Shape{}))>,  tuple<> >{}...);
-}
+OPUS_D static constexpr auto pickup_shape_impl(const Shape&, const FDim&, Target, seq<Is...>) { static_assert(size<Shape>() == size<FDim>()); return pickup_shape_apply<Shape>(pickup_filter<FDim, Target>(seq<Is...>{})); }
 
 template<typename Dim, index_t... Js>
 OPUS_D constexpr index_t dim_group_size_sum(seq<Js...>) { return (static_cast<index_t>(get<Js>(Dim{}).size()) + ... + 0); }
@@ -2340,8 +3169,13 @@ OPUS_D constexpr auto unfold_x_stride_each(const Stride& stride) {
     return transform_tuple([&](auto i_elem){ return i_elem * get<I>(stride); }, current_stride);
 }
 
-template<typename Dim, typename Shape, typename Stride, index_t... Is>
-OPUS_D constexpr auto unfold_x_stride_impl(const Stride& stride, seq<Is...>) { return concat_tuple(unfold_x_stride_each<Dim, Shape, Stride, Is>(stride)...); }
+template<typename Dim, index_t J, index_t... Gs> constexpr index_t unfold_find_group(seq<Gs...>) {
+    index_t acc = 0, r = 0; ((void)(acc += size<decltype(get<Gs>(Dim{}))>(), (acc <= J ? (void)(r = Gs + 1) : (void)0)), ...); return r; }
+template<typename Dim, typename Shape, typename Stride, index_t J> OPUS_D constexpr auto unfold_x_stride_at(const Stride& stride) {
+    constexpr index_t G = unfold_find_group<Dim, J>(make_index_seq<size<Dim>()>{}); constexpr index_t group_end = dim_offset_sum<Dim>(make_index_seq<G + 1>{});
+    return packed_stride_at<Shape, J>(make_index_seq<group_end - J - 1>{}) * get<G>(stride); }
+template<typename Dim, typename Shape, typename Stride, index_t... Js> OPUS_D constexpr auto unfold_x_stride_flat(const Stride& stride, seq<Js...>) { return opus::make_tuple(unfold_x_stride_at<Dim, Shape, Stride, Js>(stride)...); }
+template<typename Dim, typename Shape, typename Stride, index_t... Is> OPUS_D constexpr auto unfold_x_stride_impl(const Stride& stride, seq<Is...>) { return unfold_x_stride_flat<Dim, Shape, Stride>(stride, make_index_seq<size<Shape>()>{}); }
 }
 
 template<typename Shape, typename Dim, typename Target>
@@ -2373,42 +3207,24 @@ OPUS_D constexpr auto unfold_x_stride(const Dim&, const Shape&, const Stride& st
 }
 
 #define OPUS_KP_(x_) static_assert(opus::tuple_count<opus::p_dim>(opus::flatten_tuple(x_ ())) == size<C>())
+// Per-axis layout API: generates y_shape_X, p_shape_X, layout_X (3 overloads), layout_X_packed, y_layout_X
+#define OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(X)                                                                                                                       \
+    OPUS_D static constexpr auto y_shape_##X() { return y_shape(shape_##X(), dim_##X()); }                                                                          \
+    OPUS_D static constexpr auto p_shape_##X() { return p_shape(shape_##X(), dim_##X()); }                                                                          \
+    template<index_t cached_vec = 0> OPUS_D constexpr auto layout_##X() { return make_layout<cached_vec>(shape_##X());}                                             \
+    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_##X(S&& stride) { return make_layout<cached_vec>(shape_##X(), unfold_x_stride(dim_##X(), shape_##X(), stride));} \
+    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_##X(S&& stride, C&& z) { OPUS_KP_(dim_##X); return make_layout<cached_vec>(shape_##X(), unfold_x_stride(dim_##X(), shape_##X(), stride), opus::unfold_p_coord(dim_##X(), z));}  \
+    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_##X##_packed(C&& z) { OPUS_KP_(dim_##X); return make_layout_packed<cached_vec>(shape_##X(), opus::unfold_p_coord(dim_##X(), z));}   \
+    template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_##X(Ts&&... strides) {return layout_##X<cached_vec>(opus::make_tuple(strides...)); }  \
+    template<index_t cached_vec = 0> OPUS_D constexpr auto y_layout_##X() { return make_layout<cached_vec>(y_shape_##X());}
+
 // any struct implement adaptor like feature must implement(or using from base) shape_a/b/c, dim_a/b/c
 #define OPUS_ADAPTOR_LAYOUT_API_DEFINE                                                                                                                              \
     template<typename S, typename D> OPUS_D static constexpr auto y_shape(const S& /*shape*/, const D& /*dim*/) { return opus::pickup_shape(S{}, D{}, y_dim{}); }   \
     template<typename S, typename D> OPUS_D static constexpr auto p_shape(const S& /*shape*/, const D& /*dim*/) { return opus::pickup_shape(S{}, D{}, p_dim{}); }   \
-                                                                                               \
-    OPUS_D static constexpr auto y_shape_a() { return y_shape(shape_a(), dim_a()); }           \
-    OPUS_D static constexpr auto y_shape_b() { return y_shape(shape_b(), dim_b()); }           \
-    OPUS_D static constexpr auto y_shape_c() { return y_shape(shape_c(), dim_c()); }           \
-                                                                                               \
-    OPUS_D static constexpr auto p_shape_a() { return p_shape(shape_a(), dim_a()); }           \
-    OPUS_D static constexpr auto p_shape_b() { return p_shape(shape_b(), dim_b()); }           \
-    OPUS_D static constexpr auto p_shape_c() { return p_shape(shape_c(), dim_c()); }           \
-                                                                                               \
-    template<index_t cached_vec = 0> OPUS_D constexpr auto layout_a() { return make_layout<cached_vec>(shape_a());}                         \
-    template<index_t cached_vec = 0> OPUS_D constexpr auto layout_b() { return make_layout<cached_vec>(shape_b());}                         \
-    template<index_t cached_vec = 0> OPUS_D constexpr auto layout_c() { return make_layout<cached_vec>(shape_c());}                         \
-                                                                                                                                            \
-    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_a(S&& stride) { return make_layout<cached_vec>(shape_a(), unfold_x_stride(dim_a(), shape_a(), stride));} \
-    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_b(S&& stride) { return make_layout<cached_vec>(shape_b(), unfold_x_stride(dim_b(), shape_b(), stride));} \
-    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_c(S&& stride) { return make_layout<cached_vec>(shape_c(), unfold_x_stride(dim_c(), shape_c(), stride));} \
-    /* Note, all the coord passed in must be p_coord*/                                                                                      \
-    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_a(S&& stride, C&& z) { OPUS_KP_(dim_a); return make_layout<cached_vec>(shape_a(), unfold_x_stride(dim_a(), shape_a(), stride), opus::unfold_p_coord(dim_a(), z));}  \
-    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_b(S&& stride, C&& z) { OPUS_KP_(dim_b); return make_layout<cached_vec>(shape_b(), unfold_x_stride(dim_b(), shape_b(), stride), opus::unfold_p_coord(dim_b(), z));}  \
-    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_c(S&& stride, C&& z) { OPUS_KP_(dim_c); return make_layout<cached_vec>(shape_c(), unfold_x_stride(dim_c(), shape_c(), stride), opus::unfold_p_coord(dim_c(), z));}  \
-                                                                                                                                                                                                        \
-    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_a_packed(C&& z) { OPUS_KP_(dim_a); return make_layout_packed<cached_vec>(shape_a(), opus::unfold_p_coord(dim_a(), z));}   \
-    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_b_packed(C&& z) { OPUS_KP_(dim_b); return make_layout_packed<cached_vec>(shape_b(), opus::unfold_p_coord(dim_b(), z));}   \
-    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_c_packed(C&& z) { OPUS_KP_(dim_c); return make_layout_packed<cached_vec>(shape_c(), opus::unfold_p_coord(dim_c(), z));}   \
-                                                                                                                                                                                                        \
-    template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_a(Ts&&... strides) {return layout_a<cached_vec>(opus::make_tuple(strides...)); }  \
-    template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_b(Ts&&... strides) {return layout_b<cached_vec>(opus::make_tuple(strides...)); }  \
-    template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_c(Ts&&... strides) {return layout_c<cached_vec>(opus::make_tuple(strides...)); }  \
-                                                                                                                                    \
-    template<index_t cached_vec = 0> OPUS_D constexpr auto y_layout_a() { return make_layout<cached_vec>(y_shape_a());}             \
-    template<index_t cached_vec = 0> OPUS_D constexpr auto y_layout_b() { return make_layout<cached_vec>(y_shape_b());}             \
-    template<index_t cached_vec = 0> OPUS_D constexpr auto y_layout_c() { return make_layout<cached_vec>(y_shape_c());}
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(a)                                                                                                                           \
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(b)                                                                                                                           \
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(c)
 
 // Note: any class to support adaptor need include OPUS_ADAPTOR_LAYOUT_API_DEFINE and implement shape_a()/shape_b()/shape_c()
 // P indicates dim cross thread, Y indicates dim within thread, this is X layout (X=P+Y) view the tensor as a whole
@@ -2461,9 +3277,13 @@ struct mfma_adaptor : public remove_cvref_t<MFMA> {
 template<typename MFMA>
 struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
     using base = mfma_adaptor<MFMA>;
-    using base::shape_a; using base::shape_b; using base::dim_a; using base::dim_b;
+    using base::shape_a; using base::shape_b; using base::dim_a; using base::dim_b; using base::y_shape; using base::p_shape;
+    using base::y_shape_a; using base::y_shape_b; using base::p_shape_a; using base::p_shape_b;
+    using base::layout_a; using base::layout_b; using base::layout_a_packed; using base::layout_b_packed; using base::y_layout_a; using base::y_layout_b;
     OPUS_D static constexpr auto shape_c() { return tuple<number<base::grpn_c>, number<base::rept_c>, number<base::grpm_c>, number<base::pack_c>>{}; }
     OPUS_D static constexpr auto dim_c()   { return tuple<tuple<p_dim>,  tuple<y_dim, p_dim, y_dim> >{}; }    // dim encoding for C, MxN
+    // Only generate _c layout methods (shape_c/dim_c changed)
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(c)
 
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
@@ -2475,17 +3295,15 @@ struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
         typename MFMA::vtype_c c{0}; return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
 
-    template<typename VA, typename VB, typename VC>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
-        return base::operator()(b, a, c, scale_b, scale_a);
+    template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        return base::operator()(b, a, c, scale_b, scale_a, number<scale_op_sel_b>{}, number<scale_op_sel_a>{});
     }
 
-    template<typename VA, typename VB>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
-        typename MFMA::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
+    template<typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        typename MFMA::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
     }
-
-    OPUS_ADAPTOR_LAYOUT_API_DEFINE
 };
 }
 // helper class to create adaptor instance for mfma, need be paired with make_mfma(). don't directly use it
@@ -2499,11 +3317,11 @@ template<typename d_a, typename d_b, typename d_c, typename WaveMNK /*seq<m, n, 
 OPUS_D decltype(auto) make_mfma(WaveMNK&&, A&& = {}, number<warp_size_> = {}) { return A{}(mfma<d_a, d_b, d_c, get<0>(WaveMNK{}), get<1>(WaveMNK{}), get<2>(WaveMNK{}), warp_size_>{}); }
 #endif // __GFX9__
 
-// wmma_adaptor: same layout encoding as mfma_adaptor but for wave32 WMMA (gfx1250)
+// wmma_adaptor: layout encoding for wave32 WMMA (gfx1250, gfx1200/gfx1201).
 // A:[(grpm_a<p>), (rept_a<y>, grpk_a<p>, pack_a<y>)], MxK
 // B:[(grpn_b<p>), (rept_b<y>, grpk_b<p>, pack_b<y>)], NxK
 // C:[(grpm_c<p>, rept_c<y>, pack_c<y>), (grpn_c<p>)], MxN
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
 namespace impl {
 template<typename WMMA>
 struct wmma_adaptor : public remove_cvref_t<WMMA> {
@@ -2543,9 +3361,13 @@ struct wmma_adaptor : public remove_cvref_t<WMMA> {
 template<typename WMMA>
 struct wmma_adaptor_swap_ab : wmma_adaptor<WMMA> {
     using base = wmma_adaptor<WMMA>;
-    using base::shape_a; using base::shape_b; using base::dim_a; using base::dim_b;
+    using base::shape_a; using base::shape_b; using base::dim_a; using base::dim_b; using base::y_shape; using base::p_shape;
+    using base::y_shape_a; using base::y_shape_b; using base::p_shape_a; using base::p_shape_b;
+    using base::layout_a; using base::layout_b; using base::layout_a_packed; using base::layout_b_packed; using base::y_layout_a; using base::y_layout_b;
     OPUS_D static constexpr auto shape_c() { return tuple<number<base::grpn_c>, number<base::grpm_c>, number<base::rept_c>, number<base::pack_c>>{}; }
     OPUS_D static constexpr auto dim_c()   { return tuple<tuple<p_dim>,  tuple<p_dim, y_dim, y_dim> >{}; }
+    // Only generate _c layout methods (shape_c/dim_c changed)
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(c)
 
     template<typename VA, typename VB, typename VC>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c) {
@@ -2567,8 +3389,6 @@ struct wmma_adaptor_swap_ab : wmma_adaptor<WMMA> {
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, long scale_a, long scale_b) {
         return base::operator()(b, a, c, scale_a, scale_b);
     }
-
-    OPUS_ADAPTOR_LAYOUT_API_DEFINE
 };
 } // namespace impl (wmma_adaptor)
 
@@ -2580,7 +3400,7 @@ OPUS_D decltype(auto) make_wmma(number<w_m>, number<w_n>, number<w_k>, A&& = {},
 
 template<typename d_a, typename d_b, typename d_c, typename WaveMNK, typename A = wmma_adaptor, index_t warp_size_ = get_warp_size()>
 OPUS_D decltype(auto) make_wmma(WaveMNK&&, A&& = {}, number<warp_size_> = {}) { return A{}(wmma<d_a, d_b, d_c, get<0>(WaveMNK{}), get<1>(WaveMNK{}), get<2>(WaveMNK{}), warp_size_>{}); }
-#endif // __gfx1250__
+#endif // __gfx1250__ / __gfx1201__ / __gfx1200__ (wmma_adaptor)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 namespace impl {
@@ -2622,42 +3442,55 @@ struct tiled_mma_adaptor : public MMA_ {
     OPUS_D static constexpr auto dim_b()   { return embed_nested_tuple(tile_dim_b(), MMA::dim_b()); }    // dim encoding for A, MxK
     OPUS_D static constexpr auto dim_c()   { return embed_nested_tuple(tile_dim_c(), MMA::dim_c()); }    // dim encoding for A, MxK
 
+    // Cached tile sizes (avoids re-evaluating y_shape + reduce_tuple_mul in every operator/step_k)
+    static constexpr index_t mma_a_len = get<0>(reduce_tuple_mul(MMA::y_shape_a())).value;
+    static constexpr index_t mma_b_len = get<0>(reduce_tuple_mul(MMA::y_shape_b())).value;
+    static constexpr index_t mma_c_len = get<0>(reduce_tuple_mul(MMA::y_shape_c())).value;
+    static constexpr index_t tile_a_len = EXPAND_M * EXPAND_K * mma_a_len;
+    static constexpr index_t tile_b_len = EXPAND_N * EXPAND_K * mma_b_len;
+    static constexpr index_t tile_c_len = EXPAND_M * EXPAND_N * mma_c_len;
+
     // input a/b/c is array of ext type e.g. "fp16x2_t a[2];", pass "a" to this function
+    // #pragma unroll required: constexpr trip counts but clang's heuristic gives up on large tiles -> runtime indices into vtype_a/b/c -> N-way s_cselect_b64 chain on GFX9 -> SGPR-spill-to-VGPR-lane blow-up.
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
                     std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
         VC c_ {c};
-        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
-            auto s_a = a[i_m * EXPAND_K + i_k];
-            auto s_b = b[i_n * EXPAND_K + i_k];
-            auto s_c = c_[i_m * EXPAND_N + i_n];
-            s_c = MMA{}(s_a, s_b, s_c);
-            c_[i_m * EXPAND_N + i_n] = s_c;
-        });
+        #pragma unroll
+        for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
+            index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
+            auto s_a = a[i_m * EXPAND_K + i_k]; auto s_b = b[i_n * EXPAND_K + i_k]; auto s_c = c_[i_m * EXPAND_N + i_n];
+            s_c = MMA{}(s_a, s_b, s_c); c_[i_m * EXPAND_N + i_n] = s_c;
+        }
         return c_;
     }
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
                     std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
-        static_assert(size<VA>() == get<0>(reduce_tuple_mul(y_shape_a())));
-        static_assert(size<VB>() == get<0>(reduce_tuple_mul(y_shape_b())));
-        static_assert(size<VC>() == get<0>(reduce_tuple_mul(y_shape_c())));
+        static_assert(size<VA>() == tile_a_len);
+        static_assert(size<VB>() == tile_b_len);
+        static_assert(size<VC>() == tile_c_len);
 
-        constexpr auto a_len = get<0>(reduce_tuple_mul(MMA::y_shape_a()));
-        constexpr auto b_len = get<0>(reduce_tuple_mul(MMA::y_shape_b()));
-        constexpr auto c_len = get<0>(reduce_tuple_mul(MMA::y_shape_c()));
+        constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
         VC c_ {c};
-        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
-            constexpr index_t i_tile_a = i_m * EXPAND_K + i_k;
-            constexpr index_t i_tile_b = i_n * EXPAND_K + i_k;
-            constexpr index_t i_tile_c = i_m * EXPAND_N + i_n;
-            auto s_a = slice(a, number<i_tile_a * a_len>{}, number<i_tile_a * a_len + a_len>{});
-            auto s_b = slice(b, number<i_tile_b * b_len>{}, number<i_tile_b * b_len + b_len>{});
-            auto s_c = slice(c_, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
+        #pragma unroll
+        for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
+            index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
+            index_t i_a = (i_m * EXPAND_K + i_k) * a_len, i_b = (i_n * EXPAND_K + i_k) * b_len, i_c = (i_m * EXPAND_N + i_n) * c_len;
+            typename MMA::vtype_a s_a;
+            #pragma unroll
+            for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
+            typename MMA::vtype_b s_b;
+            #pragma unroll
+            for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
+            typename MMA::vtype_c s_c;
+            #pragma unroll
+            for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
             s_c = MMA{}(s_a, s_b, s_c);
-            set_slice(c_, s_c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
-        });
+            #pragma unroll
+            for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
+        }
         return c_;
     }
 
@@ -2667,31 +3500,28 @@ struct tiled_mma_adaptor : public MMA_ {
         return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
 
-    // Scaled MFMA (f8f6f4): forward scale_a, scale_b to underlying MMA
-    template<typename VA, typename VB, typename VC,
+    // Scaled MFMA (f8f6f4): forward scale_a, scale_b and per-call scale_op_sel to underlying MMA; all sub-MFMAs in this call share the same scale_op_sel (same K position in the packed-int32 scale word).
+    template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         VC c_ {c};
-        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
-            auto s_a = a[i_m * EXPAND_K + i_k];
-            auto s_b = b[i_n * EXPAND_K + i_k];
-            auto s_c = c_[i_m * EXPAND_N + i_n];
-            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
-            c_[i_m * EXPAND_N + i_n] = s_c;
-        });
+        #pragma unroll
+        for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
+            index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
+            auto s_a = a[i_m * EXPAND_K + i_k]; auto s_b = b[i_n * EXPAND_K + i_k]; auto s_c = c_[i_m * EXPAND_N + i_n];
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{}); c_[i_m * EXPAND_N + i_n] = s_c;
+        }
         return c_;
     }
 
-    template<typename VA, typename VB, typename VC,
+    template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
-        static_assert(size<VA>() == get<0>(reduce_tuple_mul(y_shape_a())));
-        static_assert(size<VB>() == get<0>(reduce_tuple_mul(y_shape_b())));
-        static_assert(size<VC>() == get<0>(reduce_tuple_mul(y_shape_c())));
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        static_assert(size<VA>() == tile_a_len);
+        static_assert(size<VB>() == tile_b_len);
+        static_assert(size<VC>() == tile_c_len);
 
-        constexpr auto a_len = get<0>(reduce_tuple_mul(MMA::y_shape_a()));
-        constexpr auto b_len = get<0>(reduce_tuple_mul(MMA::y_shape_b()));
-        constexpr auto c_len = get<0>(reduce_tuple_mul(MMA::y_shape_c()));
+        constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
         VC c_ {c};
         static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
@@ -2701,16 +3531,117 @@ struct tiled_mma_adaptor : public MMA_ {
             auto s_a = slice(a, number<i_tile_a * a_len>{}, number<i_tile_a * a_len + a_len>{});
             auto s_b = slice(b, number<i_tile_b * b_len>{}, number<i_tile_b * b_len + b_len>{});
             auto s_c = slice(c_, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
-            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
             set_slice(c_, s_c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
         });
         return c_;
     }
 
-    template<typename VA, typename VB>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
+    template<typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         vtype_c c{0};
-        return operator()(a, b, c, scale_a, scale_b);
+        return operator()(a, b, c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
+    }
+
+    template<index_t STEP_K, typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
+                    std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
+    OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
+        static_assert(STEP_K < EXPAND_K);
+        VC c_ {c};
+        static_for<EXPAND_M * EXPAND_N>([&](auto I){
+            constexpr index_t i_m = I.value / EXPAND_N, i_n = I.value % EXPAND_N;
+            auto s_a = a[i_m * EXPAND_K + STEP_K]; auto s_b = b[i_n * EXPAND_K + STEP_K]; auto s_c = c_[i_m * EXPAND_N + i_n];
+            s_c = MMA{}(s_a, s_b, s_c); c_[i_m * EXPAND_N + i_n] = s_c;
+        });
+        return c_;
+    }
+
+    template<index_t STEP_K, typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
+                    std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
+    OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
+        static_assert(STEP_K < EXPAND_K);
+        static_assert(size<VA>() == tile_a_len);
+        static_assert(size<VB>() == tile_b_len);
+        static_assert(size<VC>() == tile_c_len);
+
+        constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
+
+        VC c_ {c};
+        #pragma unroll
+        for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
+            index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
+            index_t i_a = (i_m * EXPAND_K + STEP_K) * a_len, i_b = (i_n * EXPAND_K + STEP_K) * b_len, i_c = (i_m * EXPAND_N + i_n) * c_len;
+            typename MMA::vtype_a s_a;
+            #pragma unroll
+            for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
+            typename MMA::vtype_b s_b;
+            #pragma unroll
+            for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
+            typename MMA::vtype_c s_c;
+            #pragma unroll
+            for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
+            s_c = MMA{}(s_a, s_b, s_c);
+            #pragma unroll
+            for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
+        }
+        return c_;
+    }
+
+    template<index_t STEP_K, typename VA, typename VB, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0>
+    OPUS_D constexpr auto step_k(number<STEP_K> step, const VA& a, const VB& b, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
+        vtype_c c{0};
+        return step_k(step, a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
+    }
+
+    template<index_t STEP_K, typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
+             std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
+    OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        static_assert(STEP_K < EXPAND_K);
+        VC c_ {c};
+        #pragma unroll
+        for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
+            index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
+            auto s_a = a[i_m * EXPAND_K + STEP_K]; auto s_b = b[i_n * EXPAND_K + STEP_K]; auto s_c = c_[i_m * EXPAND_N + i_n];
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{}); c_[i_m * EXPAND_N + i_n] = s_c;
+        }
+        return c_;
+    }
+
+    template<index_t STEP_K, typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
+             std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
+    OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        static_assert(STEP_K < EXPAND_K);
+        static_assert(size<VA>() == tile_a_len);
+        static_assert(size<VB>() == tile_b_len);
+        static_assert(size<VC>() == tile_c_len);
+
+        constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
+
+        VC c_ {c};
+        #pragma unroll
+        for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
+            index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
+            index_t i_a = (i_m * EXPAND_K + STEP_K) * a_len, i_b = (i_n * EXPAND_K + STEP_K) * b_len, i_c = (i_m * EXPAND_N + i_n) * c_len;
+            typename MMA::vtype_a s_a;
+            #pragma unroll
+            for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
+            typename MMA::vtype_b s_b;
+            #pragma unroll
+            for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
+            typename MMA::vtype_c s_c;
+            #pragma unroll
+            for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
+            #pragma unroll
+            for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
+        }
+        return c_;
+    }
+
+    template<index_t STEP_K, typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto step_k(number<STEP_K> step, const VA& a, const VB& b, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        vtype_c c{0};
+        return step_k(step, a, b, c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
     }
 
     OPUS_ADAPTOR_LAYOUT_API_DEFINE

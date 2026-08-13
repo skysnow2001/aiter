@@ -136,8 +136,7 @@ float flatmm_calc(const ck_tile::ScaleFlatmmHostArgs<ScaleM, ScaleN>& args,
                                              CodegenPipelineProblem::TransposeC,
                                              FlatmmConfig::NumWaveGroups,
                                              false,
-                                             1,
-                                             false>>;
+                                             1>>;
 
         // Now we only use the BlockGemmASmemBSmemCRegV1DefaultPolicy.
         using Kernel = ck_tile::FlatmmKernel<TilePartitioner, CodegenFlatmmPipeline, GemmEpilogue>;
@@ -145,7 +144,7 @@ float flatmm_calc(const ck_tile::ScaleFlatmmHostArgs<ScaleM, ScaleN>& args,
         auto kargs = Kernel::MakeKernelArgs(args);
 
         const dim3 grids      = Kernel::GridSize(kargs);
-        constexpr dim3 blocks = Kernel::BlockSize();
+        const dim3 blocks = Kernel::BlockSize();
 
         if(!Kernel::IsSupportedArgument(kargs))
         {
@@ -303,8 +302,8 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
                                   torch::Tensor& WQ,
                                   torch::Tensor& x_scale,
                                   torch::Tensor& w_scale,
-                                  torch::Tensor& out // Out:[M, N] fp16
-)
+                                  torch::Tensor& out, // Out:[M, N] fp16
+                                  int KBatch = 1)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -334,12 +333,12 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
         ck_tile::FlatmmScalePointer<1>{reinterpret_cast<AccDataType*>(w_scale.data_ptr()), n};
     args.e_ptr = (void*)out.data_ptr();
 
-    args.k_batch  = 1;
+    args.k_batch  = KBatch;
     args.M        = m;
     args.N        = n;
     args.K        = k;
-    args.stride_A = k;
-    args.stride_B = k;
+    args.stride_A = XQ.stride(-2);
+    args.stride_B = WQ.stride(-2);
     args.stride_C = n;
     args.stride_E = n;
 

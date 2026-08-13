@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import aiter
+from typing import Any, ClassVar
+
 import torch
 import torch.nn.functional as F
+from batched_gemm_bf16_common import kernels_list
+
+import aiter
+from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_BF16_BATCHED_GEMM
 from aiter.utility.base_tuner import GemmCommonTuner
-from aiter import dtypes
-from batched_gemm_bf16_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
 
 
@@ -32,27 +35,76 @@ def generate_data(b, m, n, k, device="cuda"):
     x = torch.randint(-20, 20, (b, m, k), dtype=dtypes.bf16, device=device)
     weight = torch.randint(-20, 20, (b, n, k), dtype=dtypes.bf16, device=device)
     out = torch.empty(b, m, n, dtype=dtypes.bf16, device=device)
-    return x, weight, out
+    return {"x": x, "weight": weight, "out": out}
 
 
 class BatchedGemmBf16Tuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_BF16_BATCHED_GEMM}",
         "untune_file": "aiter/configs/bf16_untuned_batched_gemm.csv",
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",
+        "config_env_name": "AITER_CONFIG_BF16_BATCHED_GEMM",
     }
+
+    def _clear_op_caches(self):
+        from aiter.ops.batched_gemm_op_bf16 import get_CKBatchedGEMM_config
+
+        get_CKBatchedGEMM_config.cache_clear()
+        if hasattr(get_CKBatchedGEMM_config, "ck_batched_gemm_dict"):
+            del get_CKBatchedGEMM_config.ck_batched_gemm_dict
 
     def _setup_specific_arguments(self):
         pass
 
+    def run_config(self, args):
+        from aiter.ops.batched_gemm_op_bf16 import batched_gemm_bf16
+        from aiter.test_common import checkAllclose, run_perftest
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            row = untunedf.iloc[i]
+            B = int(row["B"])
+            M = int(row["M"])
+            N = int(row["N"])
+            K = int(row["K"])
+            shape_str = f"({B}, {M}, {N}, {K})"
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
+            try:
+                gd = generate_data(B, M, N, K)
+                x, weight, out = gd["x"], gd["weight"], gd["out"]
+                out, us = run_perftest(
+                    batched_gemm_bf16,
+                    x,
+                    weight,
+                    out,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = run_torch(x, weight)
+                err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                status = (
+                    "ok"
+                    if err_ratio <= allowed_err_ratio
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
+                )
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as e:  # noqa: BLE001
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
+                )
+        return results
+
     def calculate(self, results, bpes=(2, 2, 2)):
-        info, time, err_ratio = results
+        info, time, _err_ratio = results
         if time == -1:
             return -1, -1
-        cu_num, b, m, n, k = info[0]
+        _gfx, _cu_num, b, m, n, k = info[0]
         flops = m * n * k * 2 * b
         tflops = round(flops / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes
@@ -76,12 +128,12 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
         tunedf,
         args,
     ):
-        issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
-        shape_grouped = False
+        shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
+        gfx = self.get_gfx()
 
         task = []
         tasks_data = []
@@ -95,8 +147,8 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
             print(f"tuning B:{B}, M:{M}, N:{N}, K:{K}")
             # kernelId, splitK, time = tune_batched_gemm(B, M, N, K, useSplitK)
             total_kernel_nums = 0
-            for i in range(kernels_num):
-                kernel = kernels_list[i]
+            for kid in range(kernels_num):
+                kernel = kernels_list[kid]
                 maxsplitK = (
                     aiter.compute_batched_gemm_SplitK(
                         M,
@@ -110,7 +162,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
                     else 0
                 )
                 for splitK in range(maxsplitK + 1):
-                    info = ((cu_num, B, M, N, K), i, splitK, "")
+                    info = ((gfx, cu_num, B, M, N, K), kid, splitK, "")
                     task.append(
                         (
                             info,
@@ -118,20 +170,23 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
                             (B, M, N, K),
                             run_batched_gemm,
                             (
-                                [0, 1, 2],
-                                i,
+                                ["x", "weight", "out"],
+                                kid,
                                 splitK,
-                            ),  # [0, 1, 2] is index of paramters for run_batched_gemm in generate_data
+                            ),
                             {
                                 "num_warmup": args.warmup,
                                 "num_iters": args.iters,
                             },
                             run_torch,
-                            ([0, 1],),
+                            (["x", "weight"],),
                             {},
                             None,
                             1e-2,
                             1e-2,
+                            None,
+                            None,
+                            ("out",),
                         )
                     )
                     total_kernel_nums = total_kernel_nums + 1
@@ -156,6 +211,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
 
 if __name__ == "__main__":
     key = [
+        "gfx",
         "cu_num",
         "B",
         "M",

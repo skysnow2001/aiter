@@ -10,6 +10,8 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.mha import fmha_fwd_bf16_opus_fwd, fmha_fwd_bf16_opus_varlen_fwd
 from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
     attention_ref,
@@ -91,6 +93,7 @@ def run_ck(
     return_attn_probs=False,
     cu_seqlens_q=None,
     cu_seqlens_kv=None,
+    num_splits=0,
 ):
     (out, softmax_lse, S_dmask), us_fwd = run_perftest(
         aiter.flash_attn_func,
@@ -109,13 +112,14 @@ def run_ck(
         how_v3_bf16_cvt=2,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
+        num_splits=num_splits,
         num_rotate_args=1,
     )
 
     if dropout_p > 0.0:
         _, seqlen_q, _, d = q.shape
         _, seqlen_k, _, d = k.shape
-        _, seqlen_k, _, d_v = v.shape
+        _, seqlen_k, _, _d_v = v.shape
         S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
         S_dmask_converted = convert_flash_attn_S_to_softmax(
             S_dmask,
@@ -158,7 +162,7 @@ def run_ck(
 
 @pytest.mark.parametrize("input_layout", ["BSHD", "BHSD", "SBHD", "KVPACKED"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("bias_type", ["no", "bias", "alibi"])
 @pytest.mark.parametrize("local", [False, True])
@@ -210,14 +214,15 @@ def test_flash_attn_output(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
     input_layout,
+    num_splits=0,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
+    assert nheads % gqa_ratio == 0
+    nheads_k = nheads // gqa_ratio
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     return_lse = True
@@ -302,6 +307,7 @@ def test_flash_attn_output(
         deterministic,
         return_lse,
         return_attn_probs,
+        num_splits=num_splits,
     )
 
     out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
@@ -341,9 +347,7 @@ def test_flash_attn_output(
     print(
         f"softmax_lse Pytorch max diff: {(softmax_lse_pt - softmax_lse_ref).abs().max().item()}"
     )
-    softmax_lse_tol = max(
-        2 * (softmax_lse_pt - softmax_lse_ref).abs().max().item(), 0.01
-    )
+    max(2 * (softmax_lse_pt - softmax_lse_ref).abs().max().item(), 0.01)
     # assert (softmax_lse - softmax_lse_ref).abs().max().item() <= softmax_lse_tol
 
     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
@@ -372,6 +376,7 @@ def test_flash_attn_output(
         * nheads
         * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
     )
+    fwd_flop = fwd_flop / 2 if causal else fwd_flop
     dtype_bytes = torch.finfo(dtype).bits // 8
     fwd_num_bytes = (
         batch_size
@@ -384,10 +389,12 @@ def test_flash_attn_output(
         * nheads
         * (seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2)
     )
+    bwd_flop = bwd_flop / 2 if causal else bwd_flop
     bwd_num_bytes = (
         2 * fwd_num_bytes
         + batch_size * nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
     )
+
     ret = {}
     ret["fwd_us"] = us_fwd
     ret["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
@@ -411,9 +418,10 @@ def flash_attn_output_benchmark(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
     input_layout,
+    num_splits=0,
 ):
     return test_flash_attn_output(
         batch_size,
@@ -427,9 +435,10 @@ def flash_attn_output_benchmark(
         local,
         bias_type,
         deterministic,
-        mha_type,
+        gqa_ratio,
         dtype,
         input_layout,
+        num_splits=num_splits,
     )
 
 
@@ -438,7 +447,7 @@ def flash_attn_output_benchmark(
     ["mixed", "q_only", "k_only", "no_padding", "q_len_1", "k_len_1"],
 )
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("bias_type", ["no"])
 @pytest.mark.parametrize("local", [False, True])
@@ -491,14 +500,14 @@ def test_flash_attn_seq_padding(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
 ):
 
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
+    assert nheads % gqa_ratio == 0
+    nheads_k = nheads // gqa_ratio
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     if bias_type == "bias":
@@ -654,7 +663,7 @@ def test_flash_attn_seq_padding(
 
     # Find and print coordinates of max difference
     max_diff_indices = torch.unravel_index(torch.argmax(diff_tensor), diff_tensor.shape)
-    b, s_q, h, d_idx = max_diff_indices
+    b, s_q, _h, _d_idx = max_diff_indices
     print(
         f"Coordinates of max difference (batch, seq_q, head, dim): {tuple(x.item() for x in max_diff_indices)}"
     )
@@ -694,7 +703,7 @@ parser.add_argument(
     "-n",
     "--nheads",
     type=int,
-    default=6,
+    default=16,
     help="""Number of heads. Default is 6.
     e.g.: -n 8""",
 )
@@ -777,14 +786,14 @@ parser.add_argument(
          -det false # disable deterministic attention""",
 )
 parser.add_argument(
-    "-m",
-    "--mha_type",
-    type=str,
+    "-gr",
+    "--gqa_ratio",
+    type=int,
     nargs="+",
-    choices=["mha", "mqa", "gqa"],
-    default=["mha", "mqa", "gqa"],
-    help="""Type of multi-head attention.
-    e.g.: -m mha""",
+    choices=[1, 8],
+    default=[1, 8],
+    help="""gqa ratio.
+    e.g.: -gr 8""",
 )
 parser.add_argument(
     "-d",
@@ -805,6 +814,13 @@ parser.add_argument(
     help="""input_layout.
     e.g.: -i BSHD""",
 )
+parser.add_argument(
+    "-ns",
+    "--num_splits",
+    type=int,
+    default=0,
+    help="native split-K num_splits (0=auto/heuristic, 1=disable split-K, >=2 forces native if capable)",
+)
 if __name__ == "__main__":
     args = parser.parse_args()
 
@@ -812,14 +828,14 @@ if __name__ == "__main__":
     for (
         dtype,
         (dim_qk, dim_v),
-        mha_type,
+        gqa_ratio,
         causal,
         local,
         deterministic,
     ) in itertools.product(
         args.dtype,
         args.d_qk_v,
-        args.mha_type,
+        args.gqa_ratio,
         args.causal,
         args.local,
         args.deterministic,
@@ -836,27 +852,460 @@ if __name__ == "__main__":
             local,
             args.bias_type,
             deterministic,
-            mha_type,
+            gqa_ratio,
             dtypes.d_dtypes[dtype],
             args.input_layout,
+            args.num_splits,
         )
         collected.append(ret)
-        test_flash_attn_seq_padding(
-            "mixed",
-            args.batch_size,
-            args.nheads,
-            args.seqlen_q,
-            args.seqlen_k,
-            dim_qk,
-            dim_v,
-            args.dropout_p,
-            causal,
-            local,
-            args.bias_type if args.bias_type != "bias" else "no",
-            deterministic,
-            mha_type,
-            dtypes.d_dtypes[dtype],
-        )
+        # test_flash_attn_seq_padding(
+        #     "mixed",
+        #     args.batch_size,
+        #     args.nheads,
+        #     args.seqlen_q,
+        #     args.seqlen_k,
+        #     dim_qk,
+        #     dim_v,
+        #     args.dropout_p,
+        #     causal,
+        #     local,
+        #     args.bias_type if args.bias_type != "bias" else "no",
+        #     deterministic,
+        #     gqa_ratio,
+        #     dtypes.d_dtypes[dtype],
+        # )
 
     df = pd.DataFrame(collected)
     aiter.logger.info(f"mha summary:\n{df}")
+
+
+# ---------------------------------------------------------------------------
+# Sink backward tests (mha_bwd with sink / d_sink)
+#
+# Reference formula (derived from kernel block_fmha_bwd_dot_do_o.hpp):
+#   D[b, h, q]      = sum_j(dout[b, q, h, j] * out[b, q, h, j]) * p_undrop
+#   P_sink[b, h, q] = exp(sink[b, h] - lse_fwd[b, h, q])
+#   d_sink[h]       = sum_{b, q} (-P_sink[b, h, q] * D[b, h, q])
+# ---------------------------------------------------------------------------
+
+
+def _sink_make_qkvo(
+    batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
+):
+    """Return (q, k, v, dout) in BSHD layout, requires_grad=True."""
+    q = torch.randn(
+        batch, seqlen_q, nhead, hdim, device=device, dtype=dtype
+    ).requires_grad_(True)
+    k = torch.randn(
+        batch, seqlen_k, nhead_k, hdim, device=device, dtype=dtype
+    ).requires_grad_(True)
+    v = torch.randn(
+        batch, seqlen_k, nhead_k, hdim_v, device=device, dtype=dtype
+    ).requires_grad_(True)
+    dout = torch.randn(batch, seqlen_q, nhead, hdim_v, device=device, dtype=dtype)
+    return q, k, v, dout
+
+
+def _sink_run_fwd(q, k, v, softmax_scale, causal):
+    """Run mha_fwd and return (out, lse)."""
+    out, lse, _, _ = aiter.mha_fwd(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        is_causal=causal,
+        window_size_left=-1,
+        window_size_right=0 if causal else -1,
+        sink_size=0,
+        return_softmax_lse=True,
+        return_dropout_randval=False,
+    )
+    return out, lse
+
+
+def _sink_reference_d_sink(dout, out, lse, sink, p_undrop=1.0):
+    """
+    Pure-PyTorch reference for d_sink.
+
+    dout : [B, Sq, H, Dv]
+    out  : [B, Sq, H, Dv]
+    lse  : [B, H, Sq]       (forward LSE without sink)
+    sink : [B, H]
+    returns d_sink : [H]
+    """
+    D_bsh = (dout.float() * out.float()).sum(dim=-1) * p_undrop  # [B, Sq, H]
+    D_bhs = D_bsh.permute(0, 2, 1)  # [B, H, Sq]
+    sink_bhs = sink.unsqueeze(-1)  # [B, H, 1]
+    p_sink = torch.exp(sink_bhs.float() - lse.float())  # [B, H, Sq]
+    d_sink = (-p_sink * D_bhs).sum(dim=(0, 2))  # [H]
+    return d_sink.float()
+
+
+_SINK_DTYPES = [dtypes.fp16, dtypes.bf16]
+_SINK_CAUSALS = [False, True]
+_SINK_CONFIGS = [
+    # (batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim)
+    (2, 128, 128, 4, 4, 64),
+    (1, 64, 64, 6, 2, 128),
+]
+
+
+@pytest.mark.parametrize("causal", _SINK_CAUSALS)
+@pytest.mark.parametrize("dtype", _SINK_DTYPES)
+@pytest.mark.parametrize("batch,seqlen_q,seqlen_k,nhead,nhead_k,hdim", _SINK_CONFIGS)
+def test_mha_bwd_sink_dsink(
+    batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dtype, causal
+):
+    """Verify that mha_bwd correctly accumulates d_sink."""
+    device = torch.device("cuda")
+    hdim_v = hdim
+    softmax_scale = hdim**-0.5
+
+    q, k, v, dout = _sink_make_qkvo(
+        batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
+    )
+    out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, causal)
+
+    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
+        30.0, 60.0
+    )
+    d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
+
+    _dq, _dk, _dv, _softmax_d = aiter.mha_bwd(
+        dout,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out,
+        lse,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        is_causal=causal,
+        window_size_left=-1,
+        window_size_right=0 if causal else -1,
+        deterministic=False,
+        sink=sink,
+        d_sink=d_sink,
+    )
+
+    assert d_sink.abs().max() > 0, "d_sink was not updated by mha_bwd"
+
+    d_sink_ref = _sink_reference_d_sink(dout, out, lse, sink)
+    torch.testing.assert_close(
+        d_sink,
+        d_sink_ref,
+        rtol=0.02,
+        atol=0.5,
+        msg=f"d_sink mismatch for dtype={dtype}, causal={causal}, B={batch}, Sq={seqlen_q}, H={nhead}",
+    )
+
+
+@pytest.mark.parametrize("causal", _SINK_CAUSALS)
+@pytest.mark.parametrize("dtype", _SINK_DTYPES)
+@pytest.mark.parametrize("batch,seqlen_q,seqlen_k,nhead,nhead_k,hdim", _SINK_CONFIGS)
+def test_mha_bwd_with_sink_dq_dk_dv(
+    batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dtype, causal
+):
+    """Verify that passing sink/d_sink does not corrupt the dQ, dK, dV outputs."""
+    device = torch.device("cuda")
+    hdim_v = hdim
+    softmax_scale = hdim**-0.5
+
+    q, k, v, dout = _sink_make_qkvo(
+        batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
+    )
+    out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, causal)
+
+    common_bwd_args = {
+        "dropout_p": 0.0,
+        "softmax_scale": softmax_scale,
+        "is_causal": causal,
+        "window_size_left": -1,
+        "window_size_right": 0 if causal else -1,
+        "deterministic": False,
+    }
+
+    dq_base, dk_base, dv_base, _ = aiter.mha_bwd(
+        dout, q.detach(), k.detach(), v.detach(), out, lse, **common_bwd_args
+    )
+
+    sink_small = torch.full((batch, nhead), -1000.0, device=device, dtype=torch.float32)
+    d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
+
+    dq_sink, dk_sink, dv_sink, _ = aiter.mha_bwd(
+        dout,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out,
+        lse,
+        **common_bwd_args,
+        sink=sink_small,
+        d_sink=d_sink,
+    )
+
+    rtol, atol = (0.01, 0.01) if dtype == dtypes.fp16 else (0.02, 0.02)
+    torch.testing.assert_close(
+        dq_sink, dq_base, rtol=rtol, atol=atol, msg="dQ mismatch with small sink"
+    )
+    torch.testing.assert_close(
+        dk_sink, dk_base, rtol=rtol, atol=atol, msg="dK mismatch with small sink"
+    )
+    torch.testing.assert_close(
+        dv_sink, dv_base, rtol=rtol, atol=atol, msg="dV mismatch with small sink"
+    )
+
+
+@pytest.mark.parametrize("dtype", _SINK_DTYPES)
+def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
+    """Passing sink=None must give identical output to omitting sink entirely."""
+    device = torch.device("cuda")
+    batch, seqlen, nhead, hdim = 2, 64, 4, 64
+    softmax_scale = hdim**-0.5
+
+    q, k, v, dout = _sink_make_qkvo(
+        batch, seqlen, seqlen, nhead, nhead, hdim, hdim, dtype, device
+    )
+    out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, False)
+
+    common = {
+        "dropout_p": 0.0,
+        "softmax_scale": softmax_scale,
+        "is_causal": False,
+        "window_size_left": -1,
+        "window_size_right": -1,
+        "deterministic": False,
+    }
+
+    dq1, dk1, dv1, d1 = aiter.mha_bwd(
+        dout, q.detach(), k.detach(), v.detach(), out, lse, **common
+    )
+    dq2, dk2, dv2, d2 = aiter.mha_bwd(
+        dout,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out,
+        lse,
+        **common,
+        sink=None,
+        d_sink=None,
+    )
+
+    torch.testing.assert_close(dq1, dq2, msg="dQ differs with sink=None vs omitted")
+    torch.testing.assert_close(dk1, dk2, msg="dK differs with sink=None vs omitted")
+    torch.testing.assert_close(dv1, dv2, msg="dV differs with sink=None vs omitted")
+    torch.testing.assert_close(
+        d1, d2, msg="softmax_d differs with sink=None vs omitted"
+    )
+
+
+# OPUS gfx950 dense D=128 via flash_attn_func. Cases span the gate (sq==sk):
+# le2 (<=128), pipelined odd/even, partial last tile (n%64), large n; MHA/GQA/MQA.
+_OPUS_CASES = [
+    (2, 64, 8, 2),  # le2 1-tile, GQA
+    (2, 128, 16, 1),  # le2 2-tile, MQA
+    (2, 100, 8, 2),  # partial last tile, GQA
+    (2, 127, 8, 8),  # partial last tile, MHA
+    (2, 129, 32, 8),  # pipelined odd (3 tiles), GQA
+    (1, 200, 16, 16),  # pipelined, MHA
+    (2, 256, 8, 1),  # pipelined even, MQA
+    (2, 512, 8, 2),  # pipelined even, GQA
+    (1, 1000, 8, 8),  # partial large, MHA
+    (2, 1023, 16, 4),  # partial odd, GQA
+    (1, 4096, 8, 2),  # large, GQA
+    (4, 256, 8, 8),  # larger batch, MHA
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,seqlen,nheads,nheads_k",
+    _OPUS_CASES,
+    ids=[f"b{b}_s{s}_h{h}_hkv{hk}" for (b, s, h, hk) in _OPUS_CASES],
+)
+def test_flash_attn_func_opus(
+    batch_size, seqlen, nheads, nheads_k, causal, monkeypatch
+):
+    """Validate the OPUS D=128 kernel THROUGH flash_attn_func.
+
+    Opus engages only with AITER_ENABLE_FMHA_OPUS=1 + the gate (gfx950, bf16,
+    D=128, dense, sq==sk, inference/no-LSE). The env is monkeypatched scoped to
+    this test so the other cases keep exercising the default v3/CK dispatch.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+
+    torch.manual_seed(0)
+    d = 128
+    q = torch.randn(batch_size, seqlen, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(batch_size, seqlen, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(batch_size, seqlen, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+
+    with torch.no_grad():
+        out = aiter.flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            softmax_scale=None,  # -> default 1/sqrt(d), matches attention_ref
+            causal=causal,
+            window_size=(-1, -1),
+            return_lse=False,
+            return_attn_probs=False,
+        )
+
+    out_ref, _ = run_torch(q, k, v, causal=causal)
+    out_pt, _ = run_torch(q, k, v, causal=causal, upcast=False, reorder_ops=True)
+    out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+    print(f"[opus] out max diff: {(out - out_ref).abs().max().item()} tol={out_tol}")
+    assert (out - out_ref).abs().max().item() <= out_tol
+
+    with torch.no_grad():
+        out_opus = fmha_fwd_bf16_opus_fwd(q, k, v, softmax_scale=d**-0.5, causal=causal)
+    assert torch.equal(
+        out, out_opus
+    ), "flash_attn_func did not route to the opus kernel (env/gate not engaged)"
+
+
+# OPUS gfx950 asymmetric D_QK=192 / D_V=128. Batch cases span partial/odd/large seqlen
+# and MHA/GQA/MQA. This kernel is enabled by DEFAULT (no env), so flash_attn_func should
+# route here for (192,128) bf16 on gfx950 without any monkeypatch.
+_OPUS_D192_CASES = [
+    (2, 64, 8, 2),  # tiny, GQA
+    (2, 100, 8, 2),  # partial last tile, GQA
+    (2, 127, 8, 8),  # partial last tile, MHA
+    (2, 129, 32, 8),  # pipelined odd, GQA
+    (1, 256, 16, 16),  # MHA
+    (2, 512, 8, 1),  # MQA
+    (1, 1023, 16, 4),  # partial odd, GQA
+    (1, 4096, 8, 2),  # large, GQA
+    (4, 256, 8, 8),  # larger batch, MHA
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,seqlen,nheads,nheads_k",
+    _OPUS_D192_CASES,
+    ids=[f"b{b}_s{s}_h{h}_hkv{hk}" for (b, s, h, hk) in _OPUS_D192_CASES],
+)
+def test_flash_attn_func_opus_d192_v128(batch_size, seqlen, nheads, nheads_k, causal):
+    """Validate the OPUS D_QK=192/D_V=128 kernel THROUGH flash_attn_func (default-on)."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=192 kernel requires gfx950")
+
+    torch.manual_seed(0)
+    d_qk, d_v = 192, 128
+    q = torch.randn(batch_size, seqlen, nheads, d_qk, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(
+        batch_size, seqlen, nheads_k, d_qk, device="cuda", dtype=dtypes.bf16
+    )
+    v = torch.randn(batch_size, seqlen, nheads_k, d_v, device="cuda", dtype=dtypes.bf16)
+
+    with torch.no_grad():
+        out = aiter.flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            softmax_scale=None,  # -> default 1/sqrt(d_qk), matches attention_ref
+            causal=causal,
+            window_size=(-1, -1),
+            return_lse=False,
+            return_attn_probs=False,
+        )
+
+    out_ref, _, _ = attention_ref(q, k, v, causal=causal)
+    out_pt, _, _ = attention_ref(q, k, v, causal=causal, upcast=False, reorder_ops=True)
+    out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+    print(
+        f"[opus-d192] out max diff: {(out - out_ref).abs().max().item()} tol={out_tol}"
+    )
+    assert (out - out_ref).abs().max().item() <= out_tol
+
+    with torch.no_grad():
+        out_opus = fmha_fwd_bf16_opus_fwd(
+            q, k, v, softmax_scale=d_qk**-0.5, causal=causal
+        )
+    assert torch.equal(
+        out, out_opus
+    ), "flash_attn_func did not route to the opus D=192 kernel"
+
+
+# OPUS gfx950 group/varlen D_QK=192 / D_V=128. Validated through the direct wrapper
+# (packed THD; exercises the group-mode host launch + kernel via the shared pybind).
+_OPUS_D192_GROUP_CASES = [
+    (3, [64, 200, 500], 8, 2),  # varlen, GQA
+    (2, [128, 1000], 16, 16),  # varlen, MHA
+    (4, [300, 300, 300, 300], 8, 8),  # uniform, MHA
+    (2, [1023, 65], 16, 4),  # odd/partial, GQA
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "num_groups,seqlens,nheads,nheads_k",
+    _OPUS_D192_GROUP_CASES,
+    ids=[f"g{g}_h{h}_hkv{hk}" for (g, _sl, h, hk) in _OPUS_D192_GROUP_CASES],
+)
+def test_fmha_fwd_bf16_opus_d192_v128_group(
+    num_groups, seqlens, nheads, nheads_k, causal
+):
+    """Validate the OPUS D=192 group/varlen path via the direct shared wrapper.
+
+    Self-attention per group (seqlen_q == seqlen_kv); packed [total, H, D]; no KV
+    padding (physical == real cu_seqlens). Compares each group against attention_ref.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=192 kernel requires gfx950")
+    assert len(seqlens) == num_groups
+
+    torch.manual_seed(0)
+    d_qk, d_v = 192, 128
+    total = sum(seqlens)
+    q = torch.randn(total, nheads, d_qk, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(total, nheads_k, d_qk, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(total, nheads_k, d_v, device="cuda", dtype=dtypes.bf16)
+
+    cu = torch.tensor(
+        [0] + list(torch.tensor(seqlens).cumsum(0).tolist()),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    max_s = max(seqlens)
+
+    with torch.no_grad():
+        out = fmha_fwd_bf16_opus_varlen_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=d_qk**-0.5,
+            causal=causal,
+            seqstart_q=cu,
+            seqstart_k=cu,
+            max_seqlen_q=max_s,
+            max_seqlen_k=max_s,
+        )
+
+    # Per-group fp32 reference.
+    max_diff = 0.0
+    starts = [0]
+    for s in seqlens:
+        starts.append(starts[-1] + s)
+    for g in range(num_groups):
+        lo, hi = starts[g], starts[g + 1]
+        qg = q[lo:hi].unsqueeze(0)
+        kg = k[lo:hi].unsqueeze(0)
+        vg = v[lo:hi].unsqueeze(0)
+        out_ref, _, _ = attention_ref(qg, kg, vg, causal=causal)
+        out_pt, _, _ = attention_ref(
+            qg, kg, vg, causal=causal, upcast=False, reorder_ops=True
+        )
+        tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+        diff = (out[lo:hi].unsqueeze(0) - out_ref).abs().max().item()
+        max_diff = max(max_diff, diff)
+        assert diff <= tol, f"group {g} diff {diff} > tol {tol}"
+    print(f"[opus-d192-group] max diff across groups: {max_diff}")

@@ -4,12 +4,15 @@
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
+
+from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
 def matmul_launch_metadata(grid, kernel, args):
-    ret = dict()
+    ret = {}
     M, N, K = None, args["N"], args["K"]
     Y, X, W = args["Y"], args["X"], args["W"]
     hist = args["ExptHist"]
@@ -27,8 +30,8 @@ def matmul_launch_metadata(grid, kernel, args):
     nbits = X.dtype.itemsize * 8
     ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
     gindx = args.get("GatherIndx", None)
-    # sindx = args.get("WriteBackIndx", None)
     if gindx is not None:
+        gindx = gindx.to(torch.int32)
         ret["name"] += "_layer1"
     else:
         ret["name"] += "_layer2"
@@ -43,8 +46,6 @@ def matmul_launch_metadata(grid, kernel, args):
     fK = K if K is not None else n_tokens
     ret[f"flops{nbits}"] = 2.0 * fM * N * fK
 
-    gindx = args.get("GatherIndx", None)
-    # sindx = args.get("WriteBackIndx", None)
     n_x_bytes = X.numel() * X.element_size()
     n_y_bytes = Y.numel() * Y.element_size()
     if hist is not None:
@@ -104,96 +105,6 @@ def unswizzle_mx_scale_cdna4(
     return x
 
 
-@triton.jit
-def clip(x, limit, clip_lower: tl.constexpr):
-    res = tl.minimum(x, limit)
-    if clip_lower:
-        res = tl.maximum(-limit, res)
-    return res
-
-
-@triton.jit
-def _swiglu(input, alpha, limit):
-    gelu, linear = tl.split(tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
-    gelu = gelu.to(tl.float32)
-    if limit is not None:
-        gelu = clip(gelu, limit, clip_lower=False)
-    linear = linear.to(tl.float32)
-    if limit is not None:
-        linear = clip(linear, limit, clip_lower=True)
-    s = gelu / (1 + tl.exp2(-1.44269504089 * alpha * gelu))
-    return tl.fma(s, linear, s)  # (s * (linear + 1))
-
-
-@triton.jit
-def _reduce_grouped(
-    X,
-    stride_xb: tl.uint64,
-    stride_xm: tl.uint64,
-    stride_xn,  #
-    Out,
-    stride_om: tl.uint64,
-    stride_on,  # output tensor
-    InIndx,
-    B,
-    N,  #
-    # fused activation function
-    APPLY_SWIGLU: tl.constexpr,
-    alpha,
-    limit,
-    ACTIVATION_REDUCTION_N: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    EVEN_N: tl.constexpr,
-):
-    pid_t = tl.program_id(1)
-    pid_n = tl.program_id(0)
-
-    BLOCK_N_OUT: tl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
-    start = pid_t * K
-    # load indices into a tuple
-    if InIndx is None:
-        indxs = (pid_t,)
-    else:
-        indxs = ()
-        for i in tl.static_range(0, K):
-            indxs = indxs + (tl.load(InIndx + start + i),)
-    XPtrs = X + (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) * stride_xn
-    OutPtrs = Out + (pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT)) * stride_on
-
-    acc = tl.zeros([BLOCK_N_OUT], dtype=tl.float32)
-    x_n_mask = pid_n * BLOCK_N + tl.arange(0, BLOCK_N) < N
-    # accumulate contributions for this tile
-    for i in tl.static_range(0, K):
-        curr = tl.zeros([BLOCK_N], dtype=tl.float32)
-        # iterate over split_k partial values
-        for b in tl.range(0, B):
-            x_row_ptr = XPtrs + indxs[i] * stride_xm + b * stride_xb
-            if EVEN_N:
-                vals = tl.load(x_row_ptr)
-            else:
-                vals = tl.load(x_row_ptr, mask=x_n_mask, other=0.0)
-            vals = vals.to(tl.float32)
-            curr += vals
-
-        # apply nonlinearity to split-k output
-        if APPLY_SWIGLU:
-            curr = _swiglu(curr[None, :], alpha, limit)
-        curr = tl.reshape(curr, [curr.shape[-1]])
-        # update final accumulator
-        acc += curr
-    # Compute per-32-col MXFP scales for this tile if requested
-    Nrem = N // ACTIVATION_REDUCTION_N
-
-    # write-back for this tile
-    out_ptr = OutPtrs + pid_t * stride_om
-    if EVEN_N:
-        tl.store(out_ptr, acc)
-    else:
-        out_n_mask = pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT) < Nrem
-        tl.store(out_ptr, acc, mask=out_n_mask)
-
-
 @triton.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a8w4(
     Y,
@@ -235,6 +146,7 @@ def _moe_gemm_a8w4(
     alpha,
     limit,
     ACTIVATION_REDUCTION_N: tl.constexpr,
+    SWIGLU_ADD_RESIDUAL: tl.constexpr,
     # MoE config
     N_EXPTS_ACT: tl.constexpr,
     # optimization config
@@ -250,6 +162,14 @@ def _moe_gemm_a8w4(
     SPLIT_K: tl.constexpr,
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
+    # Idea 1: fold per-1×32 MXFP8 (ue8m0 scale) group quant into write-back.
+    # When HAS_MX_OUT=True, Y is fp8 e4m3 and YMxScale receives uint8 ue8m0
+    # exponents at [m, n // 32]. Eliminates the standalone `downcast_to_mxfp`
+    # launch between GEMM1 and GEMM2. Requires SPLIT_K==1 and OUT_BLOCK_N % 32 == 0.
+    YMxScale=None,
+    stride_y_mx_m=0,
+    stride_y_mx_n=0,
+    HAS_MX_OUT: tl.constexpr = False,
 ):
     tl.assume(stride_y_k >= 0)
     tl.assume(stride_y_m >= 0)
@@ -481,7 +401,7 @@ def _moe_gemm_a8w4(
             bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
         acc = acc + bias[None, :]
     if APPLY_SWIGLU and SPLIT_K == 1:
-        out = _swiglu(acc, alpha, limit)
+        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
@@ -509,4 +429,36 @@ def _moe_gemm_a8w4(
         + offs_y_n.to(index_type)[None, :] * stride_y_n
     )
     mask = mask_m[:, None] & mask_n[None, :]
-    tl.store(YPtrs, out, mask=mask)
+    if HAS_MX_OUT and SPLIT_K == 1:
+        # Per-1×32 MXFP8 group quant emit. Mirrors the ue8m0 path in
+        # `_fused_clamp_silu_mul_kernel`. OUT_BLOCK_N is the post-swiglu output
+        # block size (BLOCK_N if no swiglu, BLOCK_N//2 with apply_swiglu).
+        tl.static_assert(
+            OUT_BLOCK_N % 32 == 0,
+            "HAS_MX_OUT requires OUT_BLOCK_N % 32 == 0",
+        )
+        NUM_QB: tl.constexpr = OUT_BLOCK_N // 32
+        out_safe = tl.where(mask, out, 0.0)
+        out_3d = tl.reshape(out_safe, [BLOCK_M, NUM_QB, 32])
+        # Reuse the shared MXFP8 (1x32 e8m0) scale derivation. It returns the
+        # per-group uint8 e8m0 scale and the matching fp32 multiplicative scale,
+        # both keeping the quant axis with size 1 so they broadcast over out_3d.
+        scale_e8m0, quant_scale = _mxfp8_quant_op(out_3d, QUANT_AXIS=2)
+        quant_tensor = out_3d * quant_scale
+        quant_2d = tl.reshape(quant_tensor, [BLOCK_M, OUT_BLOCK_N])
+        tl.store(YPtrs, quant_2d.to(Y.dtype.element_ty), mask=mask)
+        scale_exp_2d = tl.reshape(scale_e8m0, [BLOCK_M, NUM_QB])
+        offs_s_n = NUM_QB * pid_n + tl.arange(0, NUM_QB)
+        mask_s_n = offs_s_n < tl.cdiv(yN, 32)
+        YMxScalePtrs = (
+            YMxScale
+            + (start_m + offs_y_m).to(index_type)[:, None] * stride_y_mx_m
+            + offs_s_n.to(index_type)[None, :] * stride_y_mx_n
+        )
+        tl.store(
+            YMxScalePtrs,
+            scale_exp_2d,
+            mask=mask_m[:, None] & mask_s_n[None, :],
+        )
+    else:
+        tl.store(YPtrs, out, mask=mask)

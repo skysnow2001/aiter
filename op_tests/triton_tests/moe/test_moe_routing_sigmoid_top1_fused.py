@@ -5,6 +5,7 @@ from functools import partial
 
 import pytest
 import torch
+
 from aiter.ops.triton.moe.moe_routing_sigmoid_top1_fused import routing_sigmoid_top1
 
 
@@ -17,7 +18,8 @@ def torch_routing_sigmoid_top1(
 
     assert topk == 1
 
-    topk_weights, topk_ids = torch.topk(scores, topk, dim=1)  # [M, topk]
+    topk_ids = torch.argmax(scores, dim=1, keepdim=True)  # [M, topk]
+    topk_weights = torch.gather(scores, dim=1, index=topk_ids)  # [M, topk]
 
     topk_ids = topk_ids.to(torch.int32)
     topk_weights = topk_weights.to(torch.float32)

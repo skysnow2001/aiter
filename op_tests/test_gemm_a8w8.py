@@ -1,19 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+import random
+
 import torch
 import torch.nn.functional as F
-import random
-import os
+
 import aiter
-from aiter import dtypes
+from aiter import dtypes, hipb_create_extension, hipb_findallsols, hipb_mm
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import hipb_mm, hipb_create_extension
-from aiter.jit.utils.chip_info import get_gfx, get_cu_num
-import pandas as pd
+from aiter.test_common import benchmark, checkAllclose, perftest
+
+try:
+    from tuned_op_bench_utils import append_tuned_op_bench_rows
+except ModuleNotFoundError as e:
+    if e.name != "tuned_op_bench_utils":
+        raise
+    from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 import argparse
 from functools import lru_cache
+
+import pandas as pd
 
 # pd.set_option('display.max_rows', 200)
 # pd.set_option('display.max_columns', 100)
@@ -37,13 +48,15 @@ def is_shape_tuned(
         if os.path.exists(tuned_file):
             try:
                 df = pd.read_csv(tuned_file)
+                gfx = get_gfx()
                 cu_num = get_cu_num()
+                mask = df["cu_num"] == cu_num
+                if "gfx" in df.columns:
+                    mask = mask & (df["gfx"] == gfx)
                 _TUNED_SHAPES_CACHE[tuned_file] = set(
-                    df[df["cu_num"] == cu_num][["M", "N", "K", "q_dtype_w"]].apply(
-                        tuple, axis=1
-                    )
+                    df[mask][["M", "N", "K", "q_dtype_w"]].apply(tuple, axis=1)
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"Warning: Could not load tuned shapes: {e}")
                 _TUNED_SHAPES_CACHE[tuned_file] = set()
         else:
@@ -63,19 +76,38 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
-def run_aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
+def run_aiter_hip_bpreshuffle(
+    inp,
+    weights,
+    scaleA,
+    scaleB,
+    dtype,
+    bias=None,
+    use_gelu=False,
+    solution_index=-1,
+):
     if scaleB is not None:
         scaleB = scaleB.t()
     return hipb_mm(
         inp,
         weights.t(),
-        solution_index=-1,
-        bias=None,
+        solution_index=solution_index,
+        bias=bias,
         out_dtype=dtype,
         scaleA=scaleA,
         scaleB=scaleB,
         scaleOut=None,
         bpreshuffle=True,
+        use_gelu=use_gelu,
+    )
+
+
+def should_test_hipb_gelu(dtype, m, n, k, quantDtype):
+    return (
+        quantDtype == dtypes.fp8
+        and get_gfx() == "gfx942"
+        and dtype == dtypes.bf16
+        and (m, n, k) in {(32, 3072, 768), (4096, 3072, 768), (8192, 3072, 768)}
     )
 
 
@@ -111,7 +143,7 @@ def init_hipblas():
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128):
+def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
     x = torch.randn((m, k), dtype=dtype, device="cuda")
     weight = torch.randn((n, k), dtype=dtype, device="cuda")
     x, x_scale = aiter.pertoken_quant(x, quant_dtype=quantDtype)
@@ -138,35 +170,41 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128):
     # x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
     # print(f"{x_pad.shape=}{x_pad.stride()}")
 
-    a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
-    b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
-
-    shape_is_tuned = (quantDtype == dtypes.fp8) and is_shape_tuned(m, n, k, quantDtype)
-    if shape_is_tuned:
-        err_b = checkAllclose(
-            a,
-            b,
-            msg="ck (tuned): ",
-            rtol=1e-1,
-            atol=1e-1,
-            tol_err_ratio=1.0,
-            printLog=False,
-        )
+    a, _avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+    # skip_ck bypasses gemm_a8w8_CK (module_gemm_a8w8) only; run_gemm_ck_bpreshuffle is unaffected (gated by quantDtype below)
+    if skip_ck:
+        avg_b = err_b = None
     else:
-        err_b = checkAllclose(a, b, msg="ck: ", rtol=1e-2, atol=1e-2)
+        b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
+        shape_is_tuned = (quantDtype == dtypes.fp8) and is_shape_tuned(
+            m, n, k, quantDtype
+        )
+        if shape_is_tuned:
+            err_b = checkAllclose(
+                a,
+                b,
+                msg="ck (tuned): ",
+                rtol=1e-1,
+                atol=1e-1,
+                tol_err_ratio=1.0,
+                printLog=False,
+            )
+        else:
+            err_b = checkAllclose(
+                a, b, msg="ck: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
+            )
     if quantDtype != dtypes.i8:
         c, avg_c = run_gemm_ck_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
         # c = c + bias
-        err_c = checkAllclose(a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2)
+        err_c = checkAllclose(
+            a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
+        )
     else:
         avg_c = None
         err_c = None
 
     avg_d = None
     err_d = None
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
     if (
         dtype == dtypes.bf16
         and quantDtype == dtypes.i8
@@ -176,16 +214,127 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128):
         bias_f32 = bias.to(dtypes.fp32)
         d, avg_d = run_gemm_asm(x_asm, weightshuffle, x_scale, w_scale, bias_f32, dtype)
         if d is not None:
-            err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
+            err_d = checkAllclose(
+                a, d, msg="asm: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
+            )
         else:
             avg_d = None
 
+    avg_gelu = None
+    err_gelu = None
+    avg_gelu_sol = None
+    err_gelu_sol = None
     if quantDtype == dtypes.fp8 and get_gfx() == "gfx942" and dtype == dtypes.bf16:
         # hipb_mm bpreshuffle only supports bfloat16 as output type
         init_hipblas()
         e, avg_e = run_aiter_hip_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
         # e = e + bias
-        err_e = checkAllclose(a, e, msg="hipmm bpreshuffle: ", rtol=1e-2, atol=1e-2)
+        err_e = checkAllclose(
+            a,
+            e,
+            msg="hipmm bpreshuffle: ",
+            rtol=1e-2,
+            atol=1e-2,
+            catastrophic_check=True,
+        )
+
+        if should_test_hipb_gelu(dtype, m, n, k, quantDtype):
+            hipb_bias = torch.rand([n], dtype=dtype, device="cuda") * 10
+            base, _ = run_aiter_hip_bpreshuffle(
+                x, weightshuffle, x_scale, w_scale, dtype, bias=hipb_bias
+            )
+            ref = F.gelu(base.float()).to(dtype)
+            gelu, avg_gelu = run_aiter_hip_bpreshuffle(
+                x,
+                weightshuffle,
+                x_scale,
+                w_scale,
+                dtype,
+                bias=hipb_bias,
+                use_gelu=True,
+            )
+            err_gelu = checkAllclose(
+                ref,
+                gelu,
+                msg="hipmm gelu_bias: ",
+                rtol=5e-2,
+                atol=5e-2,
+                catastrophic_check=True,
+            )
+
+            scale_b = w_scale.t()
+            sols = hipb_findallsols(
+                x,
+                weightshuffle.t(),
+                bias=hipb_bias,
+                out_dtype=dtype,
+                scaleA=x_scale,
+                scaleB=scale_b,
+                scaleC=None,
+                bpreshuffle=True,
+                use_gelu=True,
+            )
+            if len(sols) == 0:
+                raise RuntimeError(
+                    "hipb_findallsols(use_gelu=True) returned no solutions"
+                )
+            gelu_sol, avg_gelu_sol = run_aiter_hip_bpreshuffle(
+                x,
+                weightshuffle,
+                x_scale,
+                w_scale,
+                dtype,
+                bias=hipb_bias,
+                use_gelu=True,
+                solution_index=sols[0],
+            )
+            err_gelu_sol = checkAllclose(
+                ref,
+                gelu_sol,
+                msg="hipmm gelu_bias selected sol: ",
+                rtol=5e-2,
+                atol=5e-2,
+                catastrophic_check=True,
+            )
+
+            try:
+                hipb_mm(
+                    x,
+                    weightshuffle.t(),
+                    solution_index=-1,
+                    bias=None,
+                    out_dtype=dtype,
+                    scaleA=x_scale,
+                    scaleB=scale_b,
+                    scaleOut=None,
+                    bpreshuffle=True,
+                    use_gelu=True,
+                )
+            except RuntimeError as exc:
+                if "requires bias" not in str(exc):
+                    raise
+            else:
+                raise AssertionError("hipb_mm(use_gelu=True) should require bias")
+
+            try:
+                hipb_findallsols(
+                    x,
+                    weightshuffle.t(),
+                    bias=None,
+                    out_dtype=dtype,
+                    scaleA=x_scale,
+                    scaleB=scale_b,
+                    scaleC=None,
+                    bpreshuffle=True,
+                    use_gelu=True,
+                )
+            except RuntimeError as exc:
+                if "requires bias" not in str(exc):
+                    raise
+            else:
+                raise AssertionError(
+                    "hipb_findallsols(use_gelu=True) should require bias"
+                )
     else:
         avg_e = None
         err_e = None
@@ -198,6 +347,10 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128):
         "asm err": err_d,
         "hipmm bpreshuffle us": avg_e,
         "hipmm bpreshuffle err": err_e,
+        "hipmm gelu_bias us": avg_gelu,
+        "hipmm gelu_bias err": err_gelu,
+        "hipmm gelu_bias selected sol us": avg_gelu_sol,
+        "hipmm gelu_bias selected sol err": err_gelu_sol,
     }
 
 
@@ -215,8 +368,10 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     else:
         b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
 
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
-    checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
+    msg = f"[perf] dim: {dim!s:<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    checkAllclose(
+        a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01, catastrophic_check=True
+    )
 
 
 def get_boundary_test_cases(cu_count, aligned_k):
@@ -326,16 +481,30 @@ def calculate_total_valid_points(cu_count, aligned_k):
     return total
 
 
-def test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk, pad_a=128):
+def test_normal_gemm_a8w8_pertoken_quant(
+    l_dtype, l_quantDtype, l_mnk, pad_a=128, skip_ck=False
+):
+    is_gfx1250 = get_gfx() == "gfx1250"
+    if is_gfx1250 and not skip_ck:
+        aiter.logger.warning("gfx1250 has no CK a8w8 path; forcing skip_ck=True.")
+        skip_ck = True
     df = []
     for dtype in l_dtype:
         for quantDtype in l_quantDtype:
+            if is_gfx1250 and quantDtype == dtypes.i8:
+                aiter.logger.warning(
+                    "gfx1250 a8w8 only supports fp8 pertoken quant; skipping i8 shapes."
+                )
+                continue
             for m, n, k in l_mnk:
-                ret = test_gemm(dtype, m, n, k, quantDtype, pad_a=pad_a)
+                ret = test_gemm(
+                    dtype, m, n, k, quantDtype, pad_a=pad_a, skip_ck=skip_ck
+                )
                 df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a8w8 summary (markdown):\n%s", df_md)
+    return df
 
 
 def test_skinny_gemm_a8w8_pertoken_quant():
@@ -393,9 +562,44 @@ def test_skinny_gemm_a8w8_pertoken_quant():
             for quant_dtype in [dtypes.fp8]:
                 for dtype in [dtypes.fp16, dtypes.bf16]:
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
-                    # test_gemm(dtype, m, n, k, quant_dtype)
 
 
+def _iter_flydsl_csv_cases():
+    """Yield (test_gemm kwargs, bench metadata) for flydsl tuned CSV rows."""
+    gfx, cu = get_gfx(), get_cu_num()
+    merged_csv = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+    df = pd.read_csv(merged_csv)
+    rows = df[(df["gfx"] == gfx) & (df["cu_num"] == cu) & (df["libtype"] == "flydsl")]
+    aiter.logger.info(
+        "%d flydsl rows for %s cu=%d from %s",
+        len(rows),
+        gfx,
+        cu,
+        os.path.basename(merged_csv),
+    )
+    for _, row in rows.iterrows():
+        q_dtype = dtypes.fp8 if "float8" in str(row["q_dtype_w"]) else dtypes.i8
+        yield (
+            {
+                "dtype": dtypes.bf16,
+                "m": int(row["M"]),
+                "n": int(row["N"]),
+                "k": int(row["K"]),
+                "quantDtype": q_dtype,
+                "pad_a": 128,
+                "skip_ck": True,
+            },
+            {
+                "source": "flydsl_csv",
+                "libtype": str(row.get("libtype", "")),
+                "kernelName1": str(row.get("kernelName", "")),
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -459,6 +663,10 @@ parser.add_argument(
         (4096, 8192, 1024),
         (8192, 8192, 1024),
         (16384, 8192, 1024),
+        # hipmm gelu_bias
+        (32, 3072, 768),
+        (4096, 3072, 768),
+        (8192, 3072, 768),
         # hipmm preshuffle
         (16, 7424, 8192),
         (32, 7424, 8192),
@@ -472,7 +680,123 @@ parser.add_argument(
     e.g. -mnk 1280,8192,1024""",
 )
 
+parser.add_argument(
+    "--csv",
+    type=str,
+    default=None,
+    help="""CSV file containing M, N, K columns (one shape per row).
+    e.g.: --csv shapes.csv""",
+)
+parser.add_argument(
+    "--bpreshuffle-csv",
+    type=str,
+    default=None,
+    dest="bpreshuffle_csv",
+    help="""CSV file for bpreshuffle-path shapes (skips gemm_a8w8_CK, runs ASM directly).
+    e.g.: --bpreshuffle-csv op_tests/configs/gemm_codegen_gfx_filter_bpreshuffle.csv""",
+)
+parser.add_argument(
+    "-o",
+    "--output",
+    type=str,
+    default=None,
+    help="""Directory to save results CSV.
+    e.g.: -o results/""",
+)
+parser.add_argument(
+    "--suffix",
+    type=str,
+    default="results",
+    help="""Suffix for output CSV filename.
+    e.g.: --suffix branch""",
+)
+parser.add_argument(
+    "--no-flydsl-csv",
+    action="store_true",
+    help="Skip validating flydsl shapes from tuned bpreshuffle CSVs.",
+)
+parser.add_argument(
+    "--no-legacy",
+    action="store_true",
+    help="Skip the original hardcoded shape sweep and skinny tests.",
+)
+
+
 args = parser.parse_args()
 
-test_normal_gemm_a8w8_pertoken_quant(args.dtype, args.quantDtype, args.mnk, args.pad_a)
-test_skinny_gemm_a8w8_pertoken_quant()
+if not args.no_flydsl_csv:
+    bench_csv = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
+    for kwargs, extras in _iter_flydsl_csv_cases():
+        ret = test_gemm(**kwargs)
+        ret.update(extras)
+        written = append_tuned_op_bench_rows(
+            bench_csv,
+            [ret],
+            op_name="gemm_a8w8",
+        )
+        if written:
+            aiter.logger.info(
+                "gemm_a8w8: appended %d tuned op bench row(s) to %s",
+                written,
+                bench_csv,
+            )
+
+if not args.no_legacy:
+    if args.csv is not None:
+        if not os.path.exists(args.csv):
+            raise FileNotFoundError(f"CSV file not found: {args.csv}")
+        shapes_df = pd.read_csv(args.csv)
+        print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
+        args.mnk = list(
+            zip(
+                shapes_df["M"].tolist(),
+                shapes_df["N"].tolist(),
+                shapes_df["K"].tolist(),
+            )
+        )
+
+    df = test_normal_gemm_a8w8_pertoken_quant(
+        args.dtype, args.quantDtype, args.mnk, args.pad_a
+    )
+    if get_gfx() != "gfx1250":
+        test_skinny_gemm_a8w8_pertoken_quant()
+
+    if args.output and df is not None:
+        os.makedirs(args.output, exist_ok=True)
+        if args.csv:
+            csv_filename = os.path.basename(args.csv).replace(
+                ".csv", f"_{args.suffix}.csv"
+            )
+        else:
+            csv_filename = f"gemm_a8w8_{args.suffix}.csv"
+        out_path = os.path.join(args.output, csv_filename)
+        df.to_csv(out_path, index=False)
+        print(f"Saved legacy results to: {out_path}")
+
+    if args.bpreshuffle_csv is not None:
+        if not os.path.exists(args.bpreshuffle_csv):
+            raise FileNotFoundError(
+                f"bpreshuffle CSV not found: {args.bpreshuffle_csv}"
+            )
+        bpre_df = pd.read_csv(args.bpreshuffle_csv)
+        print(
+            f"Loaded {len(bpre_df)} bpreshuffle shapes from {args.bpreshuffle_csv}",
+            flush=True,
+        )
+        bpre_mnk = list(
+            zip(
+                bpre_df["M"].tolist(),
+                bpre_df["N"].tolist(),
+                bpre_df["K"].tolist(),
+            )
+        )
+        df_bpre = test_normal_gemm_a8w8_pertoken_quant(
+            args.dtype, args.quantDtype, bpre_mnk, args.pad_a, skip_ck=True
+        )
+        if args.output and df_bpre is not None:
+            bpre_filename = os.path.basename(args.bpreshuffle_csv).replace(
+                ".csv", f"_{args.suffix}.csv"
+            )
+            bpre_out = os.path.join(args.output, bpre_filename)
+            df_bpre.to_csv(bpre_out, index=False)
+            print(f"Saved bpreshuffle results to: {bpre_out}")

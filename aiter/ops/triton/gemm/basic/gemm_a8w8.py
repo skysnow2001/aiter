@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
+
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
     _gemm_a8w8_kernel,
-    _gemm_a8w8_reduce_kernel,
     _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -19,11 +21,11 @@ def gemm_a8w8(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    bias: torch.Tensor | None = None,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
 ):
     """
     Computes 8 bit matrix multiplication Y = (X @ W^T) * (x_scale * w_scale) with optional bias.
@@ -73,7 +75,7 @@ def gemm_a8w8(
     else:
         y_pp = None
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -113,7 +115,7 @@ def gemm_a8w8(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_a8w8_reduce_kernel[grid_reduce](
+        _gemm_splitk_reduce_kernel[grid_reduce](
             y_pp,
             y,
             bias,
@@ -124,11 +126,14 @@ def gemm_a8w8(
             y_pp.stride(2),
             y.stride(0),
             y.stride(1),
-            bias is not None,
             BLOCK_SIZE_M=REDUCE_BLOCK_SIZE_M,
             BLOCK_SIZE_N=REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT=ACTUAL_KSPLIT,
             MAX_KSPLIT=triton.next_power_of_2(config["NUM_KSPLIT"]),
+            ADD_BIAS=bias is not None,
+            activation="",
+            use_activation=False,
+            KERNEL_NAME="_gemm_a8w8_reduce_kernel",
         )
 
     return y

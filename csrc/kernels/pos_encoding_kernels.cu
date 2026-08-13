@@ -1,6 +1,6 @@
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (C) 2024-2025, The vLLM team.
+ * Copyright (C) 2024-2026, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-
-#include "hip_compat.h"
-#include "dispatch_utils.h"
+#include "aiter_hip_common.h"
+#include "aiter_dispatch.h"
+#include "aiter_stream.h"
+#include "pos_encoding.h"
 
 namespace vllm
 {
@@ -36,16 +34,16 @@ namespace vllm
       // GPT-NeoX style rotary embedding.
       x_index = rot_offset;
       y_index = embed_dim + rot_offset;
-      cos = VLLM_LDG(cos_ptr + x_index);
-      sin = VLLM_LDG(sin_ptr + x_index);
+      cos = *(cos_ptr + x_index);
+      sin = *(sin_ptr + x_index);
     }
     else
     {
       // GPT-J style rotary embedding.
       x_index = 2 * rot_offset;
       y_index = 2 * rot_offset + 1;
-      cos = VLLM_LDG(cos_ptr + x_index / 2);
-      sin = VLLM_LDG(sin_ptr + x_index / 2);
+      cos = *(cos_ptr + x_index / 2);
+      sin = *(sin_ptr + x_index / 2);
     }
 
     const scalar_t x = arr[x_index];
@@ -160,14 +158,14 @@ namespace vllm
 } // namespace vllm
 
 void rotary_embedding(
-    torch::Tensor &positions, // [batch_size, seq_len] or [num_tokens]
-    torch::Tensor &query,     // [batch_size, seq_len, num_heads * head_size] or
-                              // [num_tokens, num_heads * head_size]
-    torch::Tensor &key,       // [batch_size, seq_len, num_kv_heads * head_size] or
-                              // [num_tokens, num_kv_heads * head_size]
+    aiter_tensor_t &positions, // [batch_size, seq_len] or [num_tokens]
+    aiter_tensor_t &query,     // [batch_size, seq_len, num_heads * head_size] or
+                               // [num_tokens, num_heads * head_size]
+    aiter_tensor_t &key,       // [batch_size, seq_len, num_kv_heads * head_size] or
+                               // [num_tokens, num_kv_heads * head_size]
     int64_t head_size,
-    torch::Tensor &cos_cache, // [max_position, rot_dim//2]
-    torch::Tensor &sin_cache, // [max_position, rot_dim//2]
+    aiter_tensor_t &cos_cache, // [max_position, rot_dim//2]
+    aiter_tensor_t &sin_cache, // [max_position, rot_dim//2]
     bool is_neox, bool is_nope_first)
 {
   int64_t num_tokens = query.numel() / query.size(-1);
@@ -179,41 +177,41 @@ void rotary_embedding(
 
   dim3 grid(num_tokens);
   dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(query));
-  const hipStream_t stream = at::hip::getCurrentHIPStream();
-  VLLM_DISPATCH_FLOATING_TYPES(query.scalar_type(), "rotary_embedding", [&]
+  HipDeviceGuard device_guard(query.device_id);
+  const hipStream_t stream = aiter::getCurrentHIPStream();
+  VLLM_DISPATCH_FLOATING_TYPES_rmTorch(query.dtype(), "rotary_embedding", [&]
                                {
     if (is_neox) {
       if (is_nope_first)
       {
         vllm::rotary_embedding_kernel<scalar_t, true, true><<<grid, block, 0, stream>>>(
-            positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(), rot_dim,
+            reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+            reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()), rot_dim,
             query_stride, key_stride, num_heads, num_kv_heads, head_size);
       }
       else
       {
         vllm::rotary_embedding_kernel<scalar_t, true, false><<<grid, block, 0, stream>>>(
-            positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(), rot_dim,
+            reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+            reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()), rot_dim,
             query_stride, key_stride, num_heads, num_kv_heads, head_size);
       }
     } else {
       if (is_nope_first)
       {
         vllm::rotary_embedding_kernel<scalar_t, false, true><<<grid, block, 0, stream>>>(
-            positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(), rot_dim,
+            reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+            reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()), rot_dim,
             query_stride, key_stride, num_heads, num_kv_heads, head_size);
       }
       else
       {
         vllm::rotary_embedding_kernel<scalar_t, false, false><<<grid, block, 0, stream>>>(
-            positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(), rot_dim,
+            reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+            reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()), rot_dim,
             query_stride, key_stride, num_heads, num_kv_heads, head_size);
       }
-      
+
     } });
 }
 
@@ -222,16 +220,16 @@ Batched version of rotary embedding, pack multiple LoRAs together
 and process in batched manner.
 */
 void batched_rotary_embedding(
-    torch::Tensor &positions, // [batch_size, seq_len] or [num_tokens]
-    torch::Tensor &query,     // [batch_size, seq_len, num_heads * head_size] or
-                              // [num_tokens, num_heads * head_size]
-    torch::Tensor &key,       // [batch_size, seq_len, num_kv_heads * head_size] or
-                              // [num_tokens, num_kv_heads * head_size]
+    aiter_tensor_t &positions, // [batch_size, seq_len] or [num_tokens]
+    aiter_tensor_t &query,     // [batch_size, seq_len, num_heads * head_size] or
+                               // [num_tokens, num_heads * head_size]
+    aiter_tensor_t &key,       // [batch_size, seq_len, num_kv_heads * head_size] or
+                               // [num_tokens, num_kv_heads * head_size]
     int64_t head_size,
-    torch::Tensor &cos_cache, // [max_position, rot_dim//2]
-    torch::Tensor &sin_cache, // [max_position, rot_dim//2]
+    aiter_tensor_t &cos_cache, // [max_position, rot_dim//2]
+    aiter_tensor_t &sin_cache, // [max_position, rot_dim//2]
     bool is_neox, bool is_nope_first, int64_t rot_dim,
-    torch::Tensor &cos_sin_cache_offsets // [num_tokens]
+    aiter_tensor_t &cos_sin_cache_offsets // [num_tokens]
 )
 {
   int64_t num_tokens = cos_sin_cache_offsets.size(0);
@@ -242,27 +240,27 @@ void batched_rotary_embedding(
 
   dim3 grid(num_tokens);
   dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(query));
-  const hipStream_t stream = at::hip::getCurrentHIPStream();
-  VLLM_DISPATCH_FLOATING_TYPES(query.scalar_type(), "rotary_embedding", [&]
+  HipDeviceGuard device_guard(query.device_id);
+  const hipStream_t stream = aiter::getCurrentHIPStream();
+  VLLM_DISPATCH_FLOATING_TYPES_rmTorch(query.dtype(), "rotary_embedding", [&]
                                {
     if (is_neox) {
       if (is_nope_first)
       {
         vllm::batched_rotary_embedding_kernel<scalar_t, true, true>
             <<<grid, block, 0, stream>>>(
-                positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-                key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(),
-                cos_sin_cache_offsets.data_ptr<int64_t>(), rot_dim, query_stride,
+                reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+                reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()),
+                reinterpret_cast<int64_t*>(cos_sin_cache_offsets.data_ptr()), rot_dim, query_stride,
                 key_stride, num_heads, num_kv_heads, head_size);
       }
       else
       {
         vllm::batched_rotary_embedding_kernel<scalar_t, true, false>
             <<<grid, block, 0, stream>>>(
-                positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-                key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(),
-                cos_sin_cache_offsets.data_ptr<int64_t>(), rot_dim, query_stride,
+                reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+                reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()),
+                reinterpret_cast<int64_t*>(cos_sin_cache_offsets.data_ptr()), rot_dim, query_stride,
                 key_stride, num_heads, num_kv_heads, head_size);
       }
     } else {
@@ -270,18 +268,18 @@ void batched_rotary_embedding(
       {
         vllm::batched_rotary_embedding_kernel<scalar_t, false, true>
             <<<grid, block, 0, stream>>>(
-                positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-                key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(),
-                cos_sin_cache_offsets.data_ptr<int64_t>(), rot_dim, query_stride,
+                reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+                reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()),
+                reinterpret_cast<int64_t*>(cos_sin_cache_offsets.data_ptr()), rot_dim, query_stride,
                 key_stride, num_heads, num_kv_heads, head_size);
       }
       else
       {
         vllm::batched_rotary_embedding_kernel<scalar_t, false, false>
             <<<grid, block, 0, stream>>>(
-                positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-                key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(),
-                cos_sin_cache_offsets.data_ptr<int64_t>(), rot_dim, query_stride,
+                reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+                reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()),
+                reinterpret_cast<int64_t*>(cos_sin_cache_offsets.data_ptr()), rot_dim, query_stride,
                 key_stride, num_heads, num_kv_heads, head_size);
       }
     } });

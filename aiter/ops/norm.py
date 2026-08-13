@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -14,10 +13,10 @@ MD_NAME = "module_norm"
 def gen_layer_norm_fake_tensors(
     input: Tensor,
     # normalized_shape: List[int],
-    weight: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
+    weight: Tensor | None = None,
+    bias: Tensor | None = None,
     eps: float = 1e-5,
-    x_bias: Optional[Tensor] = None,
+    x_bias: Tensor | None = None,
 ) -> Tensor:
     return torch.empty_like(
         input,
@@ -32,10 +31,10 @@ def gen_layer_norm_fake_tensors(
 def layer_norm(
     input: Tensor,
     # normalized_shape: List[int],
-    weight: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
+    weight: Tensor | None = None,
+    bias: Tensor | None = None,
     epsilon: float = 1e-5,
-    x_bias: Optional[Tensor] = None,
+    x_bias: Tensor | None = None,
 ) -> Tensor: ...
 
 
@@ -48,7 +47,7 @@ def layernorm2d_fwd(
     weight: Tensor,
     bias: Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[Tensor] = None,
+    x_bias: Tensor | None = None,
 ) -> Tensor: ...
 
 
@@ -61,7 +60,7 @@ def layernorm2d_fwd_with_add(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
-    x_bias: Optional[Tensor] = None,
+    x_bias: Tensor | None = None,
 ) -> None: ...
 
 
@@ -74,7 +73,7 @@ def layernorm2d_fwd_with_smoothquant(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
-    x_bias: Optional[Tensor] = None,
+    x_bias: Tensor | None = None,
 ) -> None: ...
 
 
@@ -89,7 +88,7 @@ def layernorm2d_fwd_with_add_smoothquant(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
-    x_bias: Optional[Tensor] = None,
+    x_bias: Tensor | None = None,
 ) -> None: ...
 
 
@@ -115,32 +114,3 @@ def layernorm2d_fwd_with_add_smoothquant(
 #     bias: Tensor,
 #     epsilon: float,
 #     x_bias: Optional[Tensor] = None,):...
-@compile_ops("module_asm_layernorm", ffi_type="ctypes")
-def layernorm2d_with_add_asm(
-    out: Tensor,
-    input: Tensor,
-    residual_in: Tensor,
-    residual_out: Tensor,
-    weight: Tensor,
-    bias: Tensor,
-    epsilon: float,
-    x_bias: Optional[Tensor] = None,
-) -> None: ...
-
-
-@compile_ops(
-    "module_asm_layernorm",
-    ffi_type="ctypes",
-)
-def layernorm2d_with_add_smoothquant_asm(
-    out: Tensor,
-    input: Tensor,
-    residual_in: Tensor,
-    residual_out: Tensor,
-    xscale: Tensor,
-    yscale: Tensor,
-    weight: Tensor,
-    bias: Tensor,
-    epsilon: float,
-    x_bias: Optional[Tensor] = None,
-) -> None: ...

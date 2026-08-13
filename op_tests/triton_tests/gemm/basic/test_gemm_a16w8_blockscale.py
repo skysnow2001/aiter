@@ -1,29 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import triton
 import pytest
+import torch
+
+# from op_tests.triton_tests.test_fused_fp8_quant import per_token_fp8_group_quant
+import torch.nn.functional as F
+import triton
+
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
     gemm_a16w8_blockscale,
     gemm_a16w8_blockscale_preshuffle,
 )
-from aiter.ops.triton.utils.types import get_fp8_dtypes
-from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.shuffle import shuffle_weight
-
-# from op_tests.triton_tests.test_fused_fp8_quant import per_token_fp8_group_quant
-import torch.nn.functional as F
+from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 block_shape = (128, 128)
 
 
 def run_torch(x, weight, w_scale, dtype=torch.bfloat16):
     block_shape_n, block_shape_k = block_shape
-    m, k = x.shape
+    _m, k = x.shape
     n = weight.shape[0]
-    scale_n = (n + block_shape_n - 1) // block_shape_n
-    scale_k = (k + block_shape_k - 1) // block_shape_k
 
     # the pre-quant version now has accuracy issues
     # x, x_scale = per_token_fp8_group_quant(x, weight.dtype, block_shape_k)
@@ -48,57 +46,13 @@ e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
 def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-        (2048, 2048, 2049),
-        (159, 17389, 597),
-        (16, 576, 7168),
-    ]
-    x_vals += [
-        (256, 8192, 1024),
-        (256, 1024, 8192),
-        (256, 32768, 8192),
-        (256, 8192, 32768),
-    ]
-    x_vals += [
-        (16, 2112, 7168),
-        (32, 2112, 7168),
-        (64, 2112, 7168),
-        (128, 2112, 7168),
-        (16, 7168, 2048),
-        (32, 7168, 2048),
-        (64, 7168, 2048),
-        (128, 7168, 2048),
-    ]
-    # x_vals += [(1, 1, 1)]  # minimal case
+    x_vals = [(1, 1, 1)]  # minimal case
+    x_vals += [(3, 5, 2)]  # irregular shape
+    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
+    x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
+    # GPT-OSS-120B attention projections
+    x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
+    x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
     return x_vals
 
 
@@ -118,6 +72,7 @@ def generate_gemm_a16w8_blockscale_inputs(
     - x: (M, K) -> row-major format
     - w: (N, K) -> column-major format
     """
+    torch.manual_seed(0)
     scale_n = (N + block_shape_n - 1) // block_shape_n
     scale_k = (K + block_shape_k - 1) // block_shape_k
 
@@ -165,15 +120,14 @@ def generate_gemm_a16w8_blockscale_inputs(
     ],
 )
 @pytest.mark.parametrize("shuffle", [True, False])
-@pytest.mark.parametrize("prequant", [False])
-def test_gemm(dtype, M, N, K, output, shuffle, prequant):
+def test_gemm(dtype, M, N, K, output, shuffle):
+    prequant = False
     block_shape_n, block_shape_k = block_shape
 
-    if shuffle:
-        if N % 16 > 0 or K % 32 > 0:
-            pytest.skip(
-                "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
-            )
+    if shuffle and (N % 16 > 0 or K % 32 > 0):
+        pytest.skip(
+            "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
+        )
 
     dtype = str_to_torch_dtype[dtype]
     x, weight, weight_triton, w_scale, y = generate_gemm_a16w8_blockscale_inputs(

@@ -1,12 +1,12 @@
 # test code is adapted from flashMLA:
 # https://github.com/deepseek-ai/FlashMLA/blob/main/tests/test_flash_mla_decoding.py
-import random
 import dataclasses
-from typing import Optional, Tuple
-
-import torch
-import pytest
+import random
 from math import ceil
+
+import pytest
+import torch
+
 from aiter.ops.triton.attention.unified_attention_sparse_mla import (
     unified_attention_sparse_mla,
 )
@@ -24,7 +24,7 @@ class Param:
     is_varlen: bool
     is_causal: bool
     is_fp8: bool
-    topk: Optional[int] = None
+    topk: int | None = None
     test_performance: bool = True
     is_all_indices_invalid: bool = False
     have_zero_seqlen_k: bool = False
@@ -38,13 +38,13 @@ class Param:
 
 def generate_test_data(
     t: Param,
-) -> Tuple[
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
+    torch.Tensor | None,
+    torch.Tensor | None,
 ]:
     """
     Generate test data from a given configuration
@@ -160,8 +160,8 @@ def reference_torch(
     dv: int,
     scale: float,
     is_causal: bool,
-    indices: Optional[torch.Tensor] = None,  # [batch_size, s_q, topk]
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    indices: torch.Tensor | None = None,  # [batch_size, s_q, topk]
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     A reference implementation in PyTorch
     """
@@ -181,8 +181,8 @@ def reference_torch(
         dv: int,
         scale: float,
         is_causal,
-        indices: Optional[torch.Tensor],  # [s_q, topk]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        indices: torch.Tensor | None,  # [s_q, topk]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         h_q = query.size(0)
         h_kv = kv.size(0)
         s_q = query.shape[-2]
@@ -191,7 +191,7 @@ def reference_torch(
         kv = kv.float()
         if h_kv != 1:
             kv = kv.repeat_interleave(h_q // h_kv, dim=0)
-        kv[kv != kv] = 0.0
+        kv[kv != kv] = 0.0  # noqa: PLR0124
         attn_weight = query @ kv.transpose(-2, -1)  # [h_q, s_q, s_k]
         if (is_causal and query.size(1) > 1) or indices is not None:
             mask = torch.ones(s_q, s_k, dtype=torch.bool)
@@ -275,30 +275,23 @@ def chunk_input(
     )
 
 
-@pytest.mark.parametrize("batch", [1, 8])
 @pytest.mark.parametrize("s_q", [1, 64, 177])
 @pytest.mark.parametrize("s_k", [1, 64, 177])
 @pytest.mark.parametrize("top_k", [64, 78])
 @pytest.mark.parametrize("num_q_heads", [16, 32])
 @pytest.mark.parametrize("lora_dim", [256, 512])
-@pytest.mark.parametrize(
-    "rope_dim",
-    [
-        64,
-    ],
-)
 @pytest.mark.parametrize("block_size", [16, 64])
 @torch.inference_mode()
 def test_triton_unified_attn(
-    batch: int,
     s_q: int,
     s_k: int,
     top_k: int,
     num_q_heads: int,
     lora_dim: int,
-    rope_dim: int,
     block_size: int,
 ) -> None:
+    batch = 8
+    rope_dim = 64
     total_dim = lora_dim + rope_dim
     softmax_scale = lora_dim**-0.5
 

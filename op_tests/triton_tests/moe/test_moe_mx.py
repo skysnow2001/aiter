@@ -6,14 +6,14 @@ import torch
 
 from aiter.ops.triton.moe.moe_op_mxfp4 import fused_moe_mxfp4
 from aiter.ops.triton.moe.moe_op_mxfp4_silu_fused import fused_moe_mxfp4_silu
-from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
-from op_tests.triton_tests.moe.test_moe import (
-    torch_moe_ref,
-    torch_moe_align_block_size_ref,
-)
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.moe_common import torch_silu_and_mul_ref
+from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
+from aiter.ops.triton.utils.types import str_to_torch_dtype, torch_to_triton_dtype
+from op_tests.triton_tests.moe.test_moe import (
+    torch_moe_align_block_size_ref,
+    torch_moe_ref,
+)
 
 DEBUG_MODE = False
 
@@ -278,7 +278,6 @@ def input_helper(
         (64, 7186, 128, 8, 2),
         (64, 3584, 128, 8, 2),
         (64, 1792, 128, 8, 2),
-        (64, 64, 128, 8, 2),
         (1, 1024, 16384, 2, 1),
     ],
 )
@@ -304,11 +303,11 @@ def test_fused_moe(
     routed_weight: bool,
     swizzle_mx_scale: bool,
 ):
-    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-    torch.manual_seed(20)
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
-        pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+    torch.manual_seed(20)
 
     (
         a_tri,

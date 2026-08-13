@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
-import triton
 
 _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = make_kernel_repr(
     "_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel",
@@ -16,6 +16,7 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
         "EVEN_K",
+        "EVEN_MN",
         "cache_modifier",
     ],
 )
@@ -24,6 +25,8 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "EVEN_MN": lambda args: (args["M"] % args["BLOCK_SIZE_M"] == 0)
+        and (args["N"] % args["BLOCK_SIZE_N"] == 0),
     }
 )
 @triton.jit(
@@ -64,6 +67,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
+    EVEN_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -136,8 +140,12 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     tl.assume(batch_id >= 0)
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    if EVEN_MN:
+        offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    else:
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     a_ptrs = a_ptr + (
         batch_id * stride_ab
         + offs_am[:, None] * stride_am
@@ -154,7 +162,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         if EVEN_K:
             a = tl.load(a_ptrs)
             b = tl.load(b_ptrs, cache_modifier=cache_modifier)
@@ -167,7 +175,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         a_scale_recip = 1.0 / a_scale
         a = tl.clamp(a * a_scale_recip, DTYPE_MIN, DTYPE_MAX).to(b_ptr.dtype.element_ty)
 
-        accumulator += tl.dot(a, b, input_precision="ieee") * a_scale
+        accumulator += tl.dot(a, b) * a_scale
 
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -175,7 +183,10 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     accumulator *= b_scale
 
     if HAS_BIAS:
-        offs_bias = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        if EVEN_MN:
+            offs_bias = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        else:
+            offs_bias = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         bias = tl.load(bias_ptr + batch_id * stride_biasb + offs_bias)
         accumulator = accumulator.to(bias_ptr.type.element_ty) + bias[None, :]
 
@@ -189,9 +200,11 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         + stride_cm * offs_cm[:, None]
         + stride_cn * offs_cn[None, :]
     )
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-
-    tl.store(c_ptrs, c, mask=c_mask)
+    if EVEN_MN:
+        tl.store(c_ptrs, c)
+    else:
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, c, mask=c_mask)
 
 
 def _get_config(
